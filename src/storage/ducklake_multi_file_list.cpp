@@ -579,18 +579,19 @@ vector<DuckLakeFileListExtendedEntry> DuckLakeMultiFileList::GetFilesExtended() 
 		auto &metadata_manager = transaction.GetMetadataManager();
 		result = metadata_manager.GetExtendedFilesForTable(read_info.table, read_info.snapshot, filter_info.get());
 	}
-	if (transaction.HasDroppedFiles()) {
+	auto local_changes = read_info.GetVisibleLocalChanges(transaction_ref);
+	if (local_changes.HasDroppedFiles()) {
 		for (idx_t file_idx = 0; file_idx < result.size(); file_idx++) {
-			if (transaction.FileIsDropped(result[file_idx].file.path)) {
+			if (local_changes.FileIsDropped(result[file_idx].file.path)) {
 				result.erase_at(file_idx);
 				file_idx--;
 			}
 		}
 	}
 	// if the transaction has any local deletes - apply them to the file list
-	if (transaction.HasLocalDeletes(read_info.table_id)) {
+	if (local_changes.HasDeletes(read_info.table_id)) {
 		for (auto &file_entry : result) {
-			transaction.GetLocalDeleteForFile(read_info.table_id, file_entry.file.path, file_entry.delete_file);
+			local_changes.GetDeleteForFile(read_info.table_id, file_entry.file.path, file_entry.delete_file);
 		}
 	}
 	idx_t transaction_row_start = DuckLakeConstants::TRANSACTION_LOCAL_ROW_ID_START;
@@ -638,26 +639,27 @@ void DuckLakeMultiFileList::GetFilesForTable() const {
 		auto &metadata_manager = transaction.GetMetadataManager();
 		files = metadata_manager.GetFilesForTable(read_info.table, read_info.snapshot, filter_info.get());
 	}
-	if (transaction.HasDroppedFiles()) {
+	auto local_changes = read_info.GetVisibleLocalChanges(transaction_ref);
+	if (local_changes.HasDroppedFiles()) {
 		for (idx_t file_idx = 0; file_idx < files.size(); file_idx++) {
-			if (transaction.FileIsDropped(files[file_idx].file.path)) {
+			if (local_changes.FileIsDropped(files[file_idx].file.path)) {
 				files.erase_at(file_idx);
 				file_idx--;
 			}
 		}
 	}
 	// if the transaction has any local deletes - apply them to the file list
-	if (transaction.HasLocalDeletes(read_info.table_id)) {
+	if (local_changes.HasDeletes(read_info.table_id)) {
 		for (auto &file_entry : files) {
-			transaction.GetLocalDeleteForFile(read_info.table_id, file_entry.file.path, file_entry.delete_file);
+			local_changes.GetDeleteForFile(read_info.table_id, file_entry.file.path, file_entry.delete_file);
 		}
 	}
 	// if the transaction has any local inlined file deletes - apply them to the file list
-	if (transaction.HasLocalInlinedFileDeletes(read_info.table_id)) {
+	if (local_changes.HasInlinedFileDeletes(read_info.table_id)) {
 		for (auto &file_entry : files) {
 			if (file_entry.file_id.IsValid()) {
-				transaction.GetLocalInlinedFileDeletesForFile(read_info.table_id, file_entry.file_id.index,
-				                                              file_entry.inlined_file_deletions);
+				local_changes.GetInlinedFileDeletesForFile(read_info.table_id, file_entry.file_id.index,
+				                                           file_entry.inlined_file_deletions);
 			}
 		}
 	}

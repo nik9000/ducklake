@@ -1,0 +1,61 @@
+# name: test/sql/transaction/snapshot_isolation_insert_inlined.test
+# description: A pinned AT read must not see an uncommitted local INSERT into inlined data
+# group: [transaction]
+
+require ducklake
+
+require parquet
+
+test-env DUCKLAKE_CONNECTION {TEST_DIR}/{UUID}.db
+
+test-env DATA_PATH {TEST_DIR}
+
+statement ok
+ATTACH 'ducklake:{DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '{DATA_PATH}/snapshot_isolation_insert_inlined', DATA_INLINING_ROW_LIMIT 10)
+
+statement ok
+CREATE TABLE ducklake.foo(i VARCHAR);
+
+statement ok
+INSERT INTO ducklake.foo VALUES ('committed');
+
+# pin the snapshot taken before the transaction makes any local changes
+statement ok
+SET VARIABLE snap = (SELECT max(snapshot_id) FROM ducklake.snapshots())
+
+statement ok
+SET VARIABLE ts = (SELECT snapshot_time FROM ducklake.snapshots() WHERE snapshot_id = getvariable('snap'))
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO ducklake.foo VALUES ('uncommitted');
+
+# an AT clause bypasses the transaction's own local uncommitted changes
+query I
+SELECT * FROM ducklake.foo AT (VERSION => getvariable('snap')) ORDER BY i
+----
+committed
+
+# ... and the same holds when the snapshot is pinned by timestamp
+query I
+SELECT * FROM ducklake.foo AT (TIMESTAMP => getvariable('ts')) ORDER BY i
+----
+committed
+
+statement ok
+COMMIT
+
+# even after the commit, the pinned read still only sees the original snapshot
+query I
+SELECT * FROM ducklake.foo AT (VERSION => getvariable('snap')) ORDER BY i
+----
+committed
+
+# the latest data reflects the change
+query I
+SELECT * FROM ducklake.foo ORDER BY i
+----
+committed
+uncommitted

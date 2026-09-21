@@ -263,6 +263,98 @@ DuckLakeFunctionInfo::Create(DuckLakeTableEntry &table, DuckLakeTransaction &tra
 	return result;
 }
 
+DuckLakeScanLocalChanges::DuckLakeScanLocalChanges(shared_ptr<DuckLakeTransaction> transaction_p)
+    : transaction(std::move(transaction_p)) {
+}
+
+vector<DuckLakeDataFile> DuckLakeScanLocalChanges::GetFiles(TableIndex table_id) const {
+	if (!transaction) {
+		return vector<DuckLakeDataFile>();
+	}
+	return transaction->GetTransactionLocalFiles(table_id);
+}
+
+shared_ptr<DuckLakeInlinedData> DuckLakeScanLocalChanges::GetInlinedData(TableIndex table_id) const {
+	if (!transaction) {
+		return nullptr;
+	}
+	return transaction->GetTransactionLocalInlinedData(table_id);
+}
+
+bool DuckLakeScanLocalChanges::HasDroppedFiles() const {
+	if (!transaction) {
+		return false;
+	}
+	return transaction->HasDroppedFiles();
+}
+
+bool DuckLakeScanLocalChanges::FileIsDropped(const string &path) const {
+	if (!transaction) {
+		return false;
+	}
+	return transaction->FileIsDropped(path);
+}
+
+bool DuckLakeScanLocalChanges::HasDeletes(TableIndex table_id) const {
+	if (!transaction) {
+		return false;
+	}
+	return transaction->HasLocalDeletes(table_id);
+}
+
+bool DuckLakeScanLocalChanges::HasDeleteForFile(TableIndex table_id, const string &path) const {
+	if (!transaction) {
+		return false;
+	}
+	return transaction->HasLocalDeleteForFile(table_id, path);
+}
+
+void DuckLakeScanLocalChanges::GetDeleteForFile(TableIndex table_id, const string &path,
+                                                DuckLakeFileData &result) const {
+	if (!transaction) {
+		return;
+	}
+	transaction->GetLocalDeleteForFile(table_id, path, result);
+}
+
+bool DuckLakeScanLocalChanges::HasInlinedFileDeletes(TableIndex table_id) const {
+	if (!transaction) {
+		return false;
+	}
+	return transaction->HasLocalInlinedFileDeletes(table_id);
+}
+
+void DuckLakeScanLocalChanges::GetInlinedFileDeletesForFile(TableIndex table_id, idx_t file_id,
+                                                            set<idx_t> &result) const {
+	if (!transaction) {
+		return;
+	}
+	transaction->GetLocalInlinedFileDeletesForFile(table_id, file_id, result);
+}
+
+optional_ptr<DuckLakeInlinedDataDeletes> DuckLakeScanLocalChanges::GetInlinedDeletes(TableIndex table_id,
+                                                                                     const string &table_name) const {
+	if (!transaction) {
+		return nullptr;
+	}
+	return transaction->GetInlinedDeletes(table_id, table_name);
+}
+
+DuckLakeScanLocalChanges DuckLakeFunctionInfo::GetVisibleLocalChanges() {
+	if (!include_transaction_local_changes) {
+		return DuckLakeScanLocalChanges();
+	}
+	return DuckLakeScanLocalChanges(GetTransaction());
+}
+
+DuckLakeScanLocalChanges
+DuckLakeFunctionInfo::GetVisibleLocalChanges(const shared_ptr<DuckLakeTransaction> &transaction) {
+	if (!include_transaction_local_changes) {
+		return DuckLakeScanLocalChanges();
+	}
+	return DuckLakeScanLocalChanges(transaction);
+}
+
 shared_ptr<DuckLakeTransaction> DuckLakeFunctionInfo::GetTransaction() {
 	auto result = transaction.lock();
 	if (!result) {
