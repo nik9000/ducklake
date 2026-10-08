@@ -193,7 +193,7 @@ struct SortedMergeSegmentReader {
 struct SortedMergeInputReader {
 	mutex lock;
 	//! Segment readers by segment index
-	map<idx_t, unique_ptr<SortedMergeSegmentReader>> segments;
+	map<idx_t, shared_ptr<SortedMergeSegmentReader>> segments;
 	//! The first row of each admitted batch that has not yet taken its units
 	multiset<idx_t> pending_batch_starts;
 	//! Rows before this are planned, so no batch that is not yet admitted needs them
@@ -225,6 +225,10 @@ struct SortedMergeGlobalState : public GlobalSourceState {
 	idx_t peak_batches_in_flight = 0;
 	idx_t batches_emitted = 0;
 	idx_t parks = 0;
+	//! Units decoded by workers waiting to start a batch
+	atomic<idx_t> units_decoded_ahead {0};
+	//! Where the next decode ahead starts looking, so inputs are visited in turn
+	atomic<idx_t> decode_ahead_cursor {0};
 	//! Decoded bytes a unit grows to before the next one starts
 	idx_t unit_size_bytes = 0;
 	//! File rows per segment, segments are aligned to row groups of this size
@@ -380,8 +384,8 @@ static void TakeUnits(ClientContext &context, const SortedMergeBindData &bind_da
 		for (auto segment_idx = first_segment; segment_idx <= last_segment; segment_idx++) {
 			auto &entry = input_reader.segments[segment_idx];
 			if (!entry) {
-				entry =
-				    make_uniq<SortedMergeSegmentReader>(segment_idx * segment_size, (segment_idx + 1) * segment_size);
+				entry = make_shared_ptr<SortedMergeSegmentReader>(segment_idx * segment_size,
+				                                                  (segment_idx + 1) * segment_size);
 			}
 			segment_readers.push_back(*entry);
 		}
@@ -441,6 +445,42 @@ static void TakeUnits(ClientContext &context, const SortedMergeBindData &bind_da
 	}
 }
 
+//! Decode the unit holding the next row the planner hands out of an input, if no worker has. Returns false when there
+//! is no such unit to decode.
+static bool DecodeAhead(ClientContext &context, const SortedMergeBindData &bind_data, SortedMergeGlobalState &gstate,
+                        SortedMergeLocalState &lstate) {
+	auto input_count = gstate.readers.size();
+	auto start = gstate.decode_ahead_cursor++;
+	for (idx_t i = 0; i < input_count; i++) {
+		auto input_idx = (start + i) % input_count;
+		auto &input_reader = *gstate.readers[input_idx];
+		shared_ptr<SortedMergeSegmentReader> reader;
+		idx_t next_row;
+		{
+			lock_guard<mutex> guard(input_reader.lock);
+			next_row = input_reader.planned_row;
+			if (next_row == NumericLimits<idx_t>::Maximum()) {
+				continue;
+			}
+			auto segment_idx = next_row / gstate.segment_size;
+			auto &entry = input_reader.segments[segment_idx];
+			if (!entry) {
+				entry = make_shared_ptr<SortedMergeSegmentReader>(segment_idx * gstate.segment_size,
+				                                                  (segment_idx + 1) * gstate.segment_size);
+			}
+			reader = entry;
+		}
+		unique_lock<mutex> reader_guard(reader->lock, std::try_to_lock);
+		if (!reader_guard.owns_lock() || reader->exhausted || reader->next_unit_start > next_row) {
+			continue;
+		}
+		DecodeNextUnit(context, bind_data, gstate, lstate, input_idx, *reader);
+		gstate.units_decoded_ahead++;
+		return true;
+	}
+	return false;
+}
+
 static void WakeParkedWorkers(SortedMergeGlobalState &gstate) {
 	annotated_lock_guard<annotated_mutex> guard(gstate.lock);
 	gstate.UnblockTasks();
@@ -460,8 +500,10 @@ enum class SortedMergeBatchResult : uint8_t { LOADED, FINISHED, PARKED };
 static SortedMergeBatchResult LoadSortedMergeBatch(ClientContext &context, const SortedMergeBindData &bind_data,
                                                    SortedMergeGlobalState &gstate, SortedMergeLocalState &lstate,
                                                    OperatorSourceInput &input) {
-	{
-		annotated_lock_guard<annotated_mutex> guard(gstate.lock);
+	// a worker over the limit decodes ahead for the next batches before it parks
+	bool nothing_to_decode = false;
+	while (true) {
+		annotated_unique_lock<annotated_mutex> guard(gstate.lock);
 		auto max_memory = BufferManager::GetBufferManager(context).GetMaxMemory();
 		auto worker_limit = gstate.worker_policy->WorkerLimit(max_memory);
 		if (worker_limit != gstate.worker_limit) {
@@ -489,6 +531,11 @@ static SortedMergeBatchResult LoadSortedMergeBatch(ClientContext &context, const
 				input.batch_index_state = SourceBatchIndexState::ADVANCED;
 				return SortedMergeBatchResult::PARKED;
 			}
+			if (!nothing_to_decode) {
+				guard.unlock();
+				nothing_to_decode = !DecodeAhead(context, bind_data, gstate, lstate);
+				continue;
+			}
 			if (gstate.BlockTask(input.interrupt_state)) {
 				gstate.parks++;
 				return SortedMergeBatchResult::PARKED;
@@ -496,6 +543,7 @@ static SortedMergeBatchResult LoadSortedMergeBatch(ClientContext &context, const
 		}
 		gstate.batches_in_flight++;
 		gstate.peak_batches_in_flight = MaxValue(gstate.peak_batches_in_flight, gstate.batches_in_flight);
+		break;
 	}
 	{
 		unique_lock<mutex> guard(gstate.plan_lock, std::try_to_lock);
@@ -590,6 +638,7 @@ static void FinishSortedMergeBatch(ExecutionContext &context, const PhysicalOper
 			info["Average Batch Bytes"] = to_string(gstate.worker_policy->AverageBatchBytes());
 			info["Batches"] = to_string(gstate.batches_emitted);
 			info["Parks"] = to_string(gstate.parks);
+			info["Units Decoded Ahead"] = to_string(gstate.units_decoded_ahead.load());
 			info["Decode Unit Bytes"] = to_string(gstate.unit_size_bytes);
 			auto &metrics = context.thread.profiler.GetOperatorMetrics(op);
 			metrics.name = op.GetName();
