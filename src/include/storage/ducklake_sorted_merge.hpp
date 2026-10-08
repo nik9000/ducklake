@@ -8,6 +8,8 @@
 
 #pragma once
 
+#include "duckdb/common/atomic.hpp"
+#include "duckdb/common/mutex.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/function/create_sort_key.hpp"
@@ -28,6 +30,8 @@ struct DuckLakeFileScanBind {
 	DuckLakeFileListEntry file;
 	//! Whether the catalog records the file as sorted on the table's current sort, so it needs no verification
 	bool known_sorted = false;
+	//! The rows in the file, deleted rows included, when the catalog records them
+	optional_idx row_count;
 };
 
 //! Scans one DuckLake data file in file order, applying field-id mapping and deletes like a regular scan
@@ -91,8 +95,10 @@ struct DuckLakeMergeSlice {
 //! Plans a k-way merge of files that are each sorted on the table's sort key, reading only the key columns
 class DuckLakeSortedMergePlanner {
 public:
+	//! Inputs are read in segments of segment_size rows, and at most max_segments_ahead segments are loaded ahead
 	DuckLakeSortedMergePlanner(ClientContext &context, DuckLakeTableEntry &table,
-	                           const vector<unique_ptr<DuckLakeFileScanBind>> &inputs);
+	                           const vector<unique_ptr<DuckLakeFileScanBind>> &inputs, idx_t segment_size,
+	                           idx_t max_segments_ahead);
 	~DuckLakeSortedMergePlanner();
 
 	//! Whether the table has a sort key that can be merged on
@@ -101,12 +107,23 @@ public:
 	bool NextBatch(idx_t max_rows, vector<DuckLakeMergeSlice> &slices);
 	//! The file row number of the next row of an input to be planned, invalid once every row of it is planned
 	optional_idx NextRow(idx_t input_idx) const;
+	//! Load sort keys ahead of the merge. Safe to call without holding the lock that guards NextBatch. Returns false
+	//! when there is nothing to load.
+	bool Prefetch();
 
 private:
+	struct KeyChunk;
+	struct KeySegment;
 	struct MergeInput;
 
 	void Initialize();
 	bool LoadChunk(MergeInput &input);
+	//! Load the next chunk of keys of a segment, the caller holds the segment's lock
+	void LoadKeys(MergeInput &input, KeySegment &segment);
+	//! Load a chunk of keys into a segment that is not yet loaded far enough ahead
+	bool TopUpSegment(MergeInput &input);
+	//! Start loading the next segment of the input with the fewest segments loaded ahead
+	bool StartSegment();
 	//! Whether the current row of lhs comes before the current row of rhs in the merged order
 	bool InputBefore(const MergeInput &lhs, const MergeInput &rhs) const;
 	//! The end of the run of rows in [input.position, end) that come before the current row of next, given that
@@ -123,9 +140,15 @@ private:
 	//! Columns scanned by the planner: the columns the sort key reads, then file_row_number
 	vector<column_t> scan_column_ids;
 	vector<unique_ptr<Expression>> key_expressions;
+	vector<LogicalType> key_types;
 	vector<OrderModifiers> modifiers;
-	unique_ptr<ExpressionExecutor> executor;
 	vector<unique_ptr<MergeInput>> merge_inputs;
+	idx_t segment_size;
+	idx_t max_segments_ahead;
+	//! Segments created and not yet merged, across inputs
+	atomic<idx_t> segments_ahead {0};
+	//! Where the next Prefetch starts looking, so inputs are visited in turn
+	atomic<idx_t> prefetch_cursor {0};
 	//! Heap of the inputs that still have rows, ordered by their current row
 	vector<idx_t> heap;
 	bool initialized = false;

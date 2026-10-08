@@ -403,3 +403,35 @@ query I
 SELECT count(*) FROM (FROM ducklake_sorted_merge('ducklake', 'wide', row_group_size := 1000) LIMIT 2500)
 ----
 2500
+
+# inputs read in many key segments, some of them entirely deleted
+statement ok
+CREATE TABLE ducklake.gaps (k INTEGER, s VARCHAR)
+
+statement ok
+ALTER TABLE ducklake.gaps SET SORTED BY (k)
+
+loop i 0 3
+
+statement ok
+INSERT INTO ducklake.gaps SELECT r * 3 + {i}, 'v' || (r * 3 + {i}) FROM range(10000) t(r)
+
+endloop
+
+statement ok
+DELETE FROM ducklake.gaps WHERE k // 3 BETWEEN 2000 AND 4999 OR k // 3 >= 9000 OR (k % 3 = 1 AND k // 3 < 1000)
+
+statement ok
+CREATE TEMP TABLE merged_gaps AS FROM ducklake_sorted_merge('ducklake', 'gaps', row_group_size := 100)
+
+query I
+SELECT count(*) FROM (SELECT rowid, k, s FROM merged_gaps) m
+FULL OUTER JOIN (SELECT row_number() OVER (ORDER BY k) - 1 AS rowid, k, s FROM ducklake.gaps) e USING (rowid)
+WHERE m.k IS DISTINCT FROM e.k OR m.s IS DISTINCT FROM e.s
+----
+0
+
+query II
+SELECT count(*), sum(row_count) FROM ducklake_sorted_merge_plan('ducklake', 'gaps', row_group_size := 100, summary := true)
+----
+170	17000

@@ -159,11 +159,43 @@ private:
 	}
 };
 
-struct DuckLakeSortedMergePlanner::MergeInput {
-	idx_t input_idx;
+//! The sort keys of a chunk of an input, in file order
+struct DuckLakeSortedMergePlanner::KeyChunk {
+	unique_ptr<Vector> sort_keys;
+	vector<MergeKey> keys;
+	vector<idx_t> row_numbers;
+};
+
+//! The keys of file rows [row_start, row_end) of an input, loaded a chunk at a time by whichever thread gets to it
+struct DuckLakeSortedMergePlanner::KeySegment {
+	KeySegment(idx_t row_start, idx_t row_end) : row_start(row_start), row_end(row_end) {
+	}
+
+	idx_t row_start;
+	idx_t row_end;
+	mutex lock;
 	unique_ptr<DuckLakeSingleFileScanner> scanner;
 	DataChunk scan_chunk;
 	DataChunk key_chunk;
+	unique_ptr<ExpressionExecutor> executor;
+	deque<unique_ptr<KeyChunk>> chunks;
+	//! Readable without the lock, to find segments worth loading
+	atomic<idx_t> loaded_chunks {0};
+	atomic<bool> done {false};
+};
+
+struct DuckLakeSortedMergePlanner::MergeInput {
+	idx_t input_idx;
+	//! Guards segments and next_segment
+	mutex segments_lock;
+	//! The segment being merged, then the segments loaded ahead
+	deque<shared_ptr<KeySegment>> segments;
+	idx_t next_segment = 0;
+	idx_t segment_count = 0;
+	//! Rows per segment, all rows in one segment when the file's row count is not known
+	idx_t segment_rows = 0;
+
+	//! The rest is only used by the merge
 	unique_ptr<Vector> sort_keys;
 	vector<MergeKey> keys;
 	vector<idx_t> row_numbers;
@@ -177,11 +209,28 @@ struct DuckLakeSortedMergePlanner::MergeInput {
 	const MergeKey &CurrentKey() const {
 		return keys[position];
 	}
+
+	//! Create the next segment, the caller holds segments_lock
+	shared_ptr<KeySegment> AddSegment() {
+		auto row_start = next_segment * segment_rows;
+		auto row_end = next_segment + 1 == segment_count ? NumericLimits<idx_t>::Maximum() : row_start + segment_rows;
+		next_segment++;
+		auto segment = make_shared_ptr<KeySegment>(row_start, row_end);
+		segments.push_back(segment);
+		return segment;
+	}
 };
 
+//! Chunks a segment loads ahead of the merge
+static constexpr idx_t CHUNKS_AHEAD = 4;
+//! Segments an input loads ahead of the merge
+static constexpr idx_t MAX_INPUT_SEGMENTS_AHEAD = 2;
+
 DuckLakeSortedMergePlanner::DuckLakeSortedMergePlanner(ClientContext &context, DuckLakeTableEntry &table,
-                                                       const vector<unique_ptr<DuckLakeFileScanBind>> &inputs)
-    : context(context), table(table), inputs(inputs) {
+                                                       const vector<unique_ptr<DuckLakeFileScanBind>> &inputs,
+                                                       idx_t segment_size, idx_t max_segments_ahead)
+    : context(context), table(table), inputs(inputs), segment_size(MaxValue<idx_t>(segment_size, 1)),
+      max_segments_ahead(max_segments_ahead) {
 	auto sort_data = table.GetSortData();
 	if (!sort_data) {
 		throw InvalidInputException("Table \"%s\" has no sort key to merge on", table.name);
@@ -214,9 +263,23 @@ DuckLakeSortedMergePlanner::DuckLakeSortedMergePlanner(ClientContext &context, D
 	for (auto &order : orders) {
 		resolver.VisitExpression(&order.expression);
 		modifiers.emplace_back(order.type, order.null_order);
+		key_types.push_back(order.expression->GetReturnType());
 		key_expressions.push_back(std::move(order.expression));
 	}
-	executor = make_uniq<ExpressionExecutor>(context, key_expressions);
+
+	for (idx_t input_idx = 0; input_idx < inputs.size(); input_idx++) {
+		auto input = make_uniq<MergeInput>();
+		input->input_idx = input_idx;
+		auto &row_count = inputs[input_idx]->row_count;
+		if (row_count.IsValid()) {
+			input->segment_rows = this->segment_size;
+			input->segment_count = (row_count.GetIndex() + this->segment_size - 1) / this->segment_size;
+		} else {
+			input->segment_rows = NumericLimits<idx_t>::Maximum();
+			input->segment_count = 1;
+		}
+		merge_inputs.push_back(std::move(input));
+	}
 }
 
 DuckLakeSortedMergePlanner::~DuckLakeSortedMergePlanner() {
@@ -228,24 +291,62 @@ bool DuckLakeSortedMergePlanner::HasMergeableSort(DuckLakeTableEntry &table) {
 }
 
 void DuckLakeSortedMergePlanner::Initialize() {
-	vector<LogicalType> key_types;
-	for (auto &expr : key_expressions) {
-		key_types.push_back(expr->GetReturnType());
-	}
-	for (idx_t input_idx = 0; input_idx < inputs.size(); input_idx++) {
-		auto input = make_uniq<MergeInput>();
-		input->input_idx = input_idx;
-		input->scanner = make_uniq<DuckLakeSingleFileScanner>(context, table, *inputs[input_idx], scan_column_ids);
-		input->scan_chunk.Initialize(context, input->scanner->GetTypes());
-		input->key_chunk.Initialize(context, key_types);
-		merge_inputs.push_back(std::move(input));
-	}
 	for (auto &input : merge_inputs) {
 		if (LoadChunk(*input)) {
 			PushInput(input->input_idx);
 		}
 	}
 	initialized = true;
+}
+
+void DuckLakeSortedMergePlanner::LoadKeys(MergeInput &input, KeySegment &segment) {
+	if (!segment.scanner) {
+		unique_ptr<TableFilterSet> filters;
+		if (input.segment_count > 1) {
+			filters = make_uniq<TableFilterSet>();
+			ProjectionIndex row_number_column(scan_column_ids.size() - 1);
+			filters->PushFilter(row_number_column, ExpressionFilter::CreateComparisonFilter(
+			                                           ExpressionType::COMPARE_GREATERTHANOREQUALTO,
+			                                           Value::BIGINT(NumericCast<int64_t>(segment.row_start))));
+			if (segment.row_end != NumericLimits<idx_t>::Maximum()) {
+				filters->PushFilter(row_number_column, ExpressionFilter::CreateComparisonFilter(
+				                                           ExpressionType::COMPARE_LESSTHAN,
+				                                           Value::BIGINT(NumericCast<int64_t>(segment.row_end))));
+			}
+		}
+		segment.scanner = make_uniq<DuckLakeSingleFileScanner>(context, table, *inputs[input.input_idx],
+		                                                       scan_column_ids, std::move(filters));
+		segment.scan_chunk.Initialize(context, segment.scanner->GetTypes());
+		segment.key_chunk.Initialize(context, key_types);
+		segment.executor = make_uniq<ExpressionExecutor>(context, key_expressions);
+	}
+	if (!segment.scanner->Scan(segment.scan_chunk)) {
+		segment.scanner.reset();
+		segment.done = true;
+		return;
+	}
+	auto count = segment.scan_chunk.size();
+	auto chunk = make_uniq<KeyChunk>();
+	segment.key_chunk.Reset();
+	segment.executor->Execute(segment.scan_chunk, segment.key_chunk);
+	chunk->sort_keys = make_uniq<Vector>(LogicalType::BLOB, count);
+	CreateSortKeyHelpers::CreateSortKey(segment.key_chunk, modifiers, *chunk->sort_keys);
+	chunk->keys.reserve(count);
+	for (auto entry : chunk->sort_keys->Values<string_t>()) {
+		chunk->keys.emplace_back(entry.GetValue());
+	}
+	auto &row_number_vector = segment.scan_chunk.data[segment.scan_chunk.ColumnCount() - 1];
+	chunk->row_numbers.reserve(count);
+	for (auto entry : row_number_vector.Values<int64_t>()) {
+		chunk->row_numbers.push_back(NumericCast<idx_t>(entry.GetValue()));
+	}
+	if (chunk->row_numbers.back() + 1 == segment.row_end) {
+		// the last row of the segment is loaded, release the scanner without another scan
+		segment.scanner.reset();
+		segment.done = true;
+	}
+	segment.chunks.push_back(std::move(chunk));
+	segment.loaded_chunks++;
 }
 
 bool DuckLakeSortedMergePlanner::LoadChunk(MergeInput &input) {
@@ -258,26 +359,44 @@ bool DuckLakeSortedMergePlanner::LoadChunk(MergeInput &input) {
 	input.keys.clear();
 	input.row_numbers.clear();
 	input.position = 0;
-	if (!input.scanner->Scan(input.scan_chunk)) {
-		input.exhausted = true;
-		return false;
+	unique_ptr<KeyChunk> chunk;
+	while (!chunk) {
+		shared_ptr<KeySegment> segment;
+		{
+			lock_guard<mutex> guard(input.segments_lock);
+			if (input.segments.empty()) {
+				if (input.next_segment == input.segment_count) {
+					input.exhausted = true;
+					return false;
+				}
+				input.AddSegment();
+				segments_ahead++;
+			}
+			segment = input.segments.front();
+		}
+		lock_guard<mutex> segment_guard(segment->lock);
+		if (segment->chunks.empty() && !segment->done) {
+			LoadKeys(input, *segment);
+		}
+		if (!segment->chunks.empty()) {
+			chunk = std::move(segment->chunks.front());
+			segment->chunks.pop_front();
+			segment->loaded_chunks--;
+		} else {
+			// every row of the segment is merged, or deleted
+			lock_guard<mutex> guard(input.segments_lock);
+			input.segments.pop_front();
+			segments_ahead--;
+		}
 	}
-	auto count = input.scan_chunk.size();
-	input.key_chunk.Reset();
-	executor->Execute(input.scan_chunk, input.key_chunk);
-	input.sort_keys = make_uniq<Vector>(LogicalType::BLOB, count);
-	CreateSortKeyHelpers::CreateSortKey(input.key_chunk, modifiers, *input.sort_keys);
-	for (auto entry : input.sort_keys->Values<string_t>()) {
-		input.keys.emplace_back(entry.GetValue());
-	}
-	auto &row_number_vector = input.scan_chunk.data[input.scan_chunk.ColumnCount() - 1];
-	for (auto entry : row_number_vector.Values<int64_t>()) {
-		input.row_numbers.push_back(NumericCast<idx_t>(entry.GetValue()));
-	}
+	input.sort_keys = std::move(chunk->sort_keys);
+	input.keys = std::move(chunk->keys);
+	input.row_numbers = std::move(chunk->row_numbers);
 
 	if (inputs[input.input_idx]->known_sorted) {
 		return true;
 	}
+	auto count = input.keys.size();
 	bool out_of_order = input.has_previous_key && input.keys[0] < input.previous_key;
 	for (idx_t i = 1; i < count && !out_of_order; i++) {
 		out_of_order = input.keys[i] < input.keys[i - 1];
@@ -287,6 +406,66 @@ bool DuckLakeSortedMergePlanner::LoadChunk(MergeInput &input) {
 		                            inputs[input.input_idx]->file.file.path, table.name);
 	}
 	return true;
+}
+
+bool DuckLakeSortedMergePlanner::TopUpSegment(MergeInput &input) {
+	vector<shared_ptr<KeySegment>> candidates;
+	{
+		lock_guard<mutex> guard(input.segments_lock);
+		for (auto &segment : input.segments) {
+			if (!segment->done && segment->loaded_chunks < CHUNKS_AHEAD) {
+				candidates.push_back(segment);
+			}
+		}
+	}
+	for (auto &segment : candidates) {
+		unique_lock<mutex> segment_guard(segment->lock, std::try_to_lock);
+		if (segment_guard.owns_lock() && !segment->done && segment->loaded_chunks < CHUNKS_AHEAD) {
+			LoadKeys(input, *segment);
+			return true;
+		}
+	}
+	return false;
+}
+
+bool DuckLakeSortedMergePlanner::StartSegment() {
+	optional_ptr<MergeInput> target;
+	shared_ptr<KeySegment> segment;
+	idx_t fewest_segments = MAX_INPUT_SEGMENTS_AHEAD + 1;
+	for (auto &input : merge_inputs) {
+		lock_guard<mutex> guard(input->segments_lock);
+		if (input->next_segment < input->segment_count && input->segments.size() < fewest_segments) {
+			fewest_segments = input->segments.size();
+			target = input.get();
+		}
+	}
+	if (!target) {
+		return false;
+	}
+	{
+		lock_guard<mutex> guard(target->segments_lock);
+		if (target->next_segment == target->segment_count || segments_ahead >= max_segments_ahead) {
+			return false;
+		}
+		segment = target->AddSegment();
+		segments_ahead++;
+	}
+	unique_lock<mutex> segment_guard(segment->lock, std::try_to_lock);
+	if (segment_guard.owns_lock() && !segment->done && segment->loaded_chunks == 0) {
+		LoadKeys(*target, *segment);
+	}
+	return true;
+}
+
+bool DuckLakeSortedMergePlanner::Prefetch() {
+	auto input_count = merge_inputs.size();
+	auto start = prefetch_cursor++;
+	for (idx_t i = 0; i < input_count; i++) {
+		if (TopUpSegment(*merge_inputs[(start + i) % input_count])) {
+			return true;
+		}
+	}
+	return segments_ahead < max_segments_ahead && StartSegment();
 }
 
 idx_t DuckLakeSortedMergePlanner::RunEnd(const MergeInput &input, idx_t start, idx_t end,

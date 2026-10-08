@@ -466,6 +466,11 @@ struct DuckLakeFileForCleanup {
 	timestamp_tz_t time;
 };
 
+struct DuckLakeDataFileMergeInfo {
+	idx_t record_count = 0;
+	optional_idx sort_id;
+};
+
 struct DuckLakeCompactionFileData : public DuckLakeCompactionBaseFileData {
 	optional_idx row_id_start;
 	MappingIndex mapping_id;

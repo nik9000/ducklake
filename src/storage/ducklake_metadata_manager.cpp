@@ -2146,22 +2146,25 @@ vector<DuckLakeFileListEntry> DuckLakeMetadataManager::GetFilesForTable(DuckLake
 	return files;
 }
 
-map<DataFileIndex, idx_t> DuckLakeMetadataManager::ReadDataFileSortIds(TableIndex table_id, DuckLakeSnapshot snapshot) {
-	map<DataFileIndex, idx_t> result;
-	if (!transaction.GetCatalog().SupportsV1_1Metadata()) {
-		return result;
-	}
+map<DataFileIndex, DuckLakeDataFileMergeInfo>
+DuckLakeMetadataManager::ReadDataFileMergeInfo(TableIndex table_id, DuckLakeSnapshot snapshot) {
+	map<DataFileIndex, DuckLakeDataFileMergeInfo> result;
+	auto has_sort_id = transaction.GetCatalog().SupportsV1_1Metadata();
 	auto query = StringUtil::Format(R"(
-SELECT data_file_id, sort_id
+SELECT data_file_id, record_count, %s
 FROM {METADATA_CATALOG}.ducklake_data_file
-WHERE table_id=%d AND sort_id IS NOT NULL AND {SNAPSHOT_ID} >= begin_snapshot
-      AND ({SNAPSHOT_ID} < end_snapshot OR end_snapshot IS NULL)
+WHERE table_id=%d AND {SNAPSHOT_ID} >= begin_snapshot AND ({SNAPSHOT_ID} < end_snapshot OR end_snapshot IS NULL)
 )",
-	                                table_id.index);
+	                                has_sort_id ? "sort_id" : "NULL::BIGINT", table_id.index);
 	auto query_result = Query(snapshot, query);
-	query_result->ThrowIfError("Failed to get data file sort ids from DuckLake: ");
+	query_result->ThrowIfError("Failed to get data file merge info from DuckLake: ");
 	for (auto &row : *query_result) {
-		result.emplace(DataFileIndex(row.GetValue<idx_t>(0)), row.GetValue<idx_t>(1));
+		DuckLakeDataFileMergeInfo info;
+		info.record_count = row.GetValue<idx_t>(1);
+		if (!row.IsNull(2)) {
+			info.sort_id = row.GetValue<idx_t>(2);
+		}
+		result.emplace(DataFileIndex(row.GetValue<idx_t>(0)), info);
 	}
 	return result;
 }

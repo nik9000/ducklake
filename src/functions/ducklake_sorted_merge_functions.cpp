@@ -52,18 +52,25 @@ static DuckLakeTableEntry &BindSortedMergeTable(ClientContext &context, TableFun
 	return table;
 }
 
+//! Row groups per segment of sort keys, each opened by its own scan
+static constexpr idx_t ROW_GROUPS_PER_KEY_SEGMENT = 8;
+
 static vector<unique_ptr<DuckLakeFileScanBind>> BindMergeInputs(ClientContext &context, DuckLakeTableEntry &table,
                                                                 const vector<DuckLakeFileListEntry> &files) {
 	auto &transaction = DuckLakeTransaction::Get(context, table.ParentCatalog());
-	auto file_sort_ids =
-	    transaction.GetMetadataManager().ReadDataFileSortIds(table.GetTableId(), transaction.GetSnapshot());
+	auto file_info =
+	    transaction.GetMetadataManager().ReadDataFileMergeInfo(table.GetTableId(), transaction.GetSnapshot());
 	auto current_sort_id = table.GetSortData()->WrittenSortId();
 	vector<unique_ptr<DuckLakeFileScanBind>> result;
 	for (auto &file : files) {
 		auto input = make_uniq<DuckLakeFileScanBind>(context, table, file);
-		auto entry = file_sort_ids.find(file.file_id);
-		input->known_sorted =
-		    current_sort_id.IsValid() && entry != file_sort_ids.end() && entry->second == current_sort_id.GetIndex();
+		auto entry = file_info.find(file.file_id);
+		if (entry != file_info.end()) {
+			auto &sort_id = entry->second.sort_id;
+			input->known_sorted =
+			    current_sort_id.IsValid() && sort_id.IsValid() && sort_id.GetIndex() == current_sort_id.GetIndex();
+			input->row_count = entry->second.record_count;
+		}
 		result.push_back(std::move(input));
 	}
 	return result;
@@ -103,7 +110,8 @@ static unique_ptr<FunctionData> DuckLakeSortedMergePlanBind(ClientContext &conte
 	return_types.emplace_back(LogicalType::BIGINT);
 
 	auto inputs = BindMergeInputs(context, table, files);
-	DuckLakeSortedMergePlanner planner(context, table, inputs);
+	DuckLakeSortedMergePlanner planner(context, table, inputs, row_group_size * ROW_GROUPS_PER_KEY_SEGMENT,
+	                                   inputs.size());
 	auto result = make_uniq<MetadataBindData>();
 	vector<DuckLakeMergeSlice> slices;
 	for (idx_t row_group = 0; planner.NextBatch(row_group_size, slices); row_group++) {
@@ -265,17 +273,27 @@ struct SortedMergeLocalState : public LocalSourceState {
 static constexpr idx_t UNIT_MEMORY_FRACTION = 16;
 static constexpr idx_t MIN_UNIT_SIZE_BYTES = 1ULL << 20;
 static constexpr idx_t MAX_UNIT_SIZE_BYTES = 32ULL << 20;
+//! Memory limit per segment of sort keys the planner may load ahead
+static constexpr idx_t KEY_SEGMENT_MEMORY = 64ULL << 20;
 
 static unique_ptr<SortedMergeGlobalState> InitSortedMergeGlobal(ClientContext &context,
                                                                 const SortedMergeBindData &bind_data) {
 	auto result = make_uniq<SortedMergeGlobalState>();
 	result->inputs = BindMergeInputs(context, bind_data.table, bind_data.files);
-	result->planner = make_uniq<DuckLakeSortedMergePlanner>(context, bind_data.table, result->inputs);
+	// every input keeps about one unit decoded, so size units to keep that a small part of the memory limit
+	auto max_memory = BufferManager::GetBufferManager(context).GetMaxMemory();
+	// load key segments ahead only when the memory limit leaves room for at least one per input
+	auto input_count = result->inputs.size();
+	auto segments_ahead = max_memory / KEY_SEGMENT_MEMORY;
+	if (segments_ahead < 2 * input_count) {
+		segments_ahead = input_count;
+	}
+	result->planner =
+	    make_uniq<DuckLakeSortedMergePlanner>(context, bind_data.table, result->inputs,
+	                                          bind_data.row_group_size * ROW_GROUPS_PER_KEY_SEGMENT, segments_ahead);
 	for (idx_t input_idx = 0; input_idx < result->inputs.size(); input_idx++) {
 		result->readers.push_back(make_uniq<SortedMergeInputReader>());
 	}
-	// every input keeps about one unit decoded, so size units to keep that a small part of the memory limit
-	auto max_memory = BufferManager::GetBufferManager(context).GetMaxMemory();
 	auto unit_size = max_memory / (UNIT_MEMORY_FRACTION * MaxValue<idx_t>(result->inputs.size(), 1));
 	result->unit_size_bytes = MaxValue(MIN_UNIT_SIZE_BYTES, MinValue(MAX_UNIT_SIZE_BYTES, unit_size));
 	if (bind_data.decode_unit_size.IsValid()) {
@@ -480,7 +498,27 @@ static SortedMergeBatchResult LoadSortedMergeBatch(ClientContext &context, const
 		gstate.peak_batches_in_flight = MaxValue(gstate.peak_batches_in_flight, gstate.batches_in_flight);
 	}
 	{
-		lock_guard<mutex> guard(gstate.plan_lock);
+		unique_lock<mutex> guard(gstate.plan_lock, std::try_to_lock);
+		while (!guard.owns_lock()) {
+			// load sort keys ahead for the worker that is planning. A worker still reporting its finished batch
+			// would hold back the sink meanwhile, so it first reports the next batch index, like a parked worker.
+			auto floor = gstate.next_batch_index.load();
+			if (gstate.requires_batch_index && floor > lstate.batch_index) {
+				{
+					annotated_lock_guard<annotated_mutex> admission_guard(gstate.lock);
+					gstate.batches_in_flight--;
+				}
+				WakeParkedWorkers(gstate);
+				lstate.batch_index = floor;
+				input.batch_index_state = SourceBatchIndexState::ADVANCED;
+				return SortedMergeBatchResult::PARKED;
+			}
+			if (!gstate.planner->Prefetch()) {
+				guard.lock();
+				break;
+			}
+			guard.try_lock();
+		}
 		if (!gstate.planner->NextBatch(bind_data.row_group_size, lstate.slices)) {
 			{
 				annotated_lock_guard<annotated_mutex> admission_guard(gstate.lock);
