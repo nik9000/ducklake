@@ -357,3 +357,49 @@ FULL OUTER JOIN (SELECT row_number() OVER (ORDER BY k) - 1 AS rowid, k, s FROM d
 WHERE m.k IS DISTINCT FROM e.k OR m.s IS DISTINCT FROM e.s
 ----
 0
+
+# wide rows under a small memory limit
+statement ok
+CREATE TABLE ducklake.wide (k INTEGER, s VARCHAR)
+
+statement ok
+ALTER TABLE ducklake.wide SET SORTED BY (k)
+
+loop i 0 3
+
+statement ok
+INSERT INTO ducklake.wide SELECT r * 3 + {i}, repeat(chr((97 + ((r * 3 + {i}) % 26))::INTEGER), 1000) FROM range(20000) t(r)
+
+endloop
+
+statement ok
+SET memory_limit = '30MB'
+
+statement ok
+CREATE TEMP TABLE merged_wide AS FROM ducklake_sorted_merge('ducklake', 'wide', row_group_size := 5000)
+
+statement ok
+RESET memory_limit
+
+query I
+SELECT count(*) FROM (SELECT rowid, k, s FROM merged_wide) m
+FULL OUTER JOIN (SELECT row_number() OVER (ORDER BY k) - 1 AS rowid, k, s FROM ducklake.wide) e USING (rowid)
+WHERE m.k IS DISTINCT FROM e.k OR m.s IS DISTINCT FROM e.s
+----
+0
+
+# a LIMIT stops the merge partway through, with other workers parked at a batch boundary
+statement ok
+SET threads = 4
+
+query I
+SELECT k FROM ducklake_sorted_merge('ducklake', 'units', row_group_size := 100) LIMIT 3
+----
+1
+2
+3
+
+query I
+SELECT count(*) FROM (FROM ducklake_sorted_merge('ducklake', 'wide', row_group_size := 1000) LIMIT 2500)
+----
+2500

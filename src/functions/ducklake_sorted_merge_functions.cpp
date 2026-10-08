@@ -3,6 +3,9 @@
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/execution/partition_info.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
+#include "duckdb/execution/physical_operator.hpp"
+#include "duckdb/execution/physical_plan_generator.hpp"
+#include "duckdb/planner/operator/logical_extension_operator.hpp"
 #include "duckdb/storage/buffer_manager.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
 #include "storage/ducklake_catalog.hpp"
@@ -139,7 +142,7 @@ DuckLakeSortedMergePlanFunction::DuckLakeSortedMergePlanFunction()
 //===--------------------------------------------------------------------===//
 // ducklake_sorted_merge
 //===--------------------------------------------------------------------===//
-struct SortedMergeBindData : public TableFunctionData {
+struct SortedMergeBindData {
 	explicit SortedMergeBindData(DuckLakeTableEntry &table) : table(table) {
 	}
 
@@ -187,19 +190,29 @@ struct SortedMergeInputReader {
 	idx_t planned_row = 0;
 };
 
-struct SortedMergeGlobalState : public GlobalTableFunctionState {
-	mutex lock;
+//! The inherited lock guards the batch counts and the parked workers
+struct SortedMergeGlobalState : public GlobalSourceState {
+	//! Guards the planner
+	mutex plan_lock;
 	vector<unique_ptr<DuckLakeFileScanBind>> inputs;
 	unique_ptr<DuckLakeSortedMergePlanner> planner;
 	vector<unique_ptr<SortedMergeInputReader>> readers;
-	idx_t next_batch_index = 0;
+	//! The batch index of the next batch the planner hands out
+	atomic<idx_t> next_batch_index {0};
 	idx_t max_threads = 1;
+	//! Whether the sink orders rows by batch index, so a parked worker reports the batches it has finished
+	bool requires_batch_index = false;
+	//! Batches being emitted
+	idx_t batches_in_flight = 0;
+	//! Moving average of the decoded bytes of a full batch, as the sink measures it
+	idx_t batch_bytes = 0;
+	bool planner_exhausted = false;
 	//! Decoded bytes a unit grows to before the next one starts
 	idx_t unit_size_bytes = 0;
 	//! File rows per segment, segments are aligned to row groups of this size
 	idx_t segment_size = 0;
 
-	idx_t MaxThreads() const override {
+	idx_t MaxThreads() override {
 		return max_threads;
 	}
 };
@@ -218,9 +231,17 @@ struct SortedMergeInputCursor {
 	bool positioned = false;
 };
 
-struct SortedMergeLocalState : public LocalTableFunctionState {
+struct SortedMergeLocalState : public LocalSourceState {
+	explicit SortedMergeLocalState(SortedMergeGlobalState &gstate) : gstate(gstate) {
+	}
+	//! A worker that stops inside a batch, e.g. when a LIMIT is reached, gives its slot back to the parked workers
+	~SortedMergeLocalState() override;
+
+	SortedMergeGlobalState &gstate;
 	idx_t batch_index = 0;
 	bool has_batch = false;
+	//! Decoded bytes of the rows emitted for the current batch
+	idx_t batch_bytes = 0;
 	vector<DuckLakeMergeSlice> slices;
 	idx_t slice_idx = 0;
 	idx_t slice_offset = 0;
@@ -230,33 +251,18 @@ struct SortedMergeLocalState : public LocalTableFunctionState {
 	DataChunk payload;
 };
 
-static unique_ptr<FunctionData> DuckLakeSortedMergeBind(ClientContext &context, TableFunctionBindInput &input,
-                                                        vector<LogicalType> &return_types, vector<Identifier> &names) {
-	vector<DuckLakeFileListEntry> files;
-	idx_t row_group_size;
-	auto &table = BindSortedMergeTable(context, input, files, row_group_size);
-	for (auto &column : table.GetColumns().Physical()) {
-		names.push_back(column.GetName());
-		return_types.push_back(column.Type());
-	}
-	auto result = make_uniq<SortedMergeBindData>(table);
-	result->files = std::move(files);
-	result->row_group_size = row_group_size;
-	Value decode_unit_size;
-	if (DuckLakeTableFunctionUtil::TryGetNonNullOption(input, "decode_unit_size", "integer", decode_unit_size)) {
-		result->decode_unit_size = NumericCast<idx_t>(MaxValue<int64_t>(decode_unit_size.GetValue<int64_t>(), 1));
-	}
-	return std::move(result);
-}
-
+//! Batches a worker keeps in the batch copy, and the fraction of the memory limit the batch copy takes
+static constexpr idx_t BATCHES_PER_WORKER = 2;
+static constexpr idx_t WRITER_MEMORY_FRACTION = 4;
+//! Weight of the batch byte average: the latest batch counts 1/BATCH_BYTES_WEIGHT
+static constexpr idx_t BATCH_BYTES_WEIGHT = 4;
 //! Units take at most this fraction of the memory limit across all inputs
 static constexpr idx_t UNIT_MEMORY_FRACTION = 16;
 static constexpr idx_t MIN_UNIT_SIZE_BYTES = 1ULL << 20;
 static constexpr idx_t MAX_UNIT_SIZE_BYTES = 32ULL << 20;
 
-static unique_ptr<GlobalTableFunctionState> DuckLakeSortedMergeInitGlobal(ClientContext &context,
-                                                                          TableFunctionInitInput &input) {
-	auto &bind_data = input.bind_data->Cast<SortedMergeBindData>();
+static unique_ptr<SortedMergeGlobalState> InitSortedMergeGlobal(ClientContext &context,
+                                                                const SortedMergeBindData &bind_data) {
 	auto result = make_uniq<SortedMergeGlobalState>();
 	result->inputs = BindMergeInputs(context, bind_data.table, bind_data.files);
 	result->planner = make_uniq<DuckLakeSortedMergePlanner>(context, bind_data.table, result->inputs);
@@ -275,11 +281,9 @@ static unique_ptr<GlobalTableFunctionState> DuckLakeSortedMergeInitGlobal(Client
 	return std::move(result);
 }
 
-static unique_ptr<LocalTableFunctionState> DuckLakeSortedMergeInitLocal(ExecutionContext &context,
-                                                                        TableFunctionInitInput &input,
-                                                                        GlobalTableFunctionState *global_state) {
-	auto &bind_data = input.bind_data->Cast<SortedMergeBindData>();
-	auto result = make_uniq<SortedMergeLocalState>();
+static unique_ptr<SortedMergeLocalState> InitSortedMergeLocal(const SortedMergeBindData &bind_data,
+                                                              SortedMergeGlobalState &gstate) {
+	auto result = make_uniq<SortedMergeLocalState>(gstate);
 	for (auto &column : bind_data.table.GetColumns().Physical()) {
 		result->payload_columns.push_back(result->payload_types.size());
 		result->payload_types.push_back(column.Type());
@@ -413,12 +417,67 @@ static void TakeUnits(ClientContext &context, const SortedMergeBindData &bind_da
 	}
 }
 
-static bool LoadSortedMergeBatch(ClientContext &context, const SortedMergeBindData &bind_data,
-                                 SortedMergeGlobalState &gstate, SortedMergeLocalState &lstate) {
+//! Workers that may emit batches at once. The batch copy takes a quarter of the memory limit and each worker keeps
+//! about two batches in it: one it builds and one waiting to be written in order.
+static idx_t SortedMergeWorkerLimit(ClientContext &context, const SortedMergeGlobalState &gstate)
+    DUCKDB_REQUIRES(gstate.lock) {
+	if (gstate.batch_bytes == 0) {
+		// nothing measured yet - one worker measures the first batch
+		return 1;
+	}
+	auto max_memory = BufferManager::GetBufferManager(context).GetMaxMemory();
+	auto workers = max_memory / (BATCHES_PER_WORKER * WRITER_MEMORY_FRACTION * gstate.batch_bytes);
+	return MaxValue<idx_t>(1, MinValue(workers, gstate.max_threads));
+}
+
+static void WakeParkedWorkers(SortedMergeGlobalState &gstate) {
+	annotated_lock_guard<annotated_mutex> guard(gstate.lock);
+	gstate.UnblockTasks();
+}
+
+SortedMergeLocalState::~SortedMergeLocalState() {
+	if (!has_batch) {
+		return;
+	}
+	annotated_lock_guard<annotated_mutex> guard(gstate.lock);
+	gstate.batches_in_flight--;
+	gstate.UnblockTasks();
+}
+
+enum class SortedMergeBatchResult : uint8_t { LOADED, FINISHED, PARKED };
+
+static SortedMergeBatchResult LoadSortedMergeBatch(ClientContext &context, const SortedMergeBindData &bind_data,
+                                                   SortedMergeGlobalState &gstate, SortedMergeLocalState &lstate,
+                                                   OperatorSourceInput &input) {
 	{
-		lock_guard<mutex> guard(gstate.lock);
+		annotated_lock_guard<annotated_mutex> guard(gstate.lock);
+		if (!gstate.planner_exhausted && gstate.batches_in_flight >= SortedMergeWorkerLimit(context, gstate) &&
+		    input.interrupt_state.CanCallback()) {
+			// park at the batch boundary. First report the next batch index the planner hands out, so the sink takes
+			// the finished batch and moves on: every batch below it is done or being emitted by a running worker. The
+			// pipeline calls back right after taking the new index, and that call parks.
+			auto floor = gstate.next_batch_index.load();
+			if (gstate.requires_batch_index && floor > lstate.batch_index) {
+				lstate.batch_index = floor;
+				input.batch_index_state = SourceBatchIndexState::ADVANCED;
+				return SortedMergeBatchResult::PARKED;
+			}
+			if (gstate.BlockTask(input.interrupt_state)) {
+				return SortedMergeBatchResult::PARKED;
+			}
+		}
+		gstate.batches_in_flight++;
+	}
+	{
+		lock_guard<mutex> guard(gstate.plan_lock);
 		if (!gstate.planner->NextBatch(bind_data.row_group_size, lstate.slices)) {
-			return false;
+			{
+				annotated_lock_guard<annotated_mutex> admission_guard(gstate.lock);
+				gstate.batches_in_flight--;
+				gstate.planner_exhausted = true;
+			}
+			WakeParkedWorkers(gstate);
+			return SortedMergeBatchResult::FINISHED;
 		}
 		lstate.batch_index = gstate.next_batch_index++;
 		// the slices of one input in a batch cover a contiguous range of its live rows
@@ -440,13 +499,58 @@ static bool LoadSortedMergeBatch(ClientContext &context, const SortedMergeBindDa
 			reader.planned_row = next_row.IsValid() ? next_row.GetIndex() : NumericLimits<idx_t>::Maximum();
 		}
 	}
+	// parked workers report a higher batch index
+	WakeParkedWorkers(gstate);
 	for (auto &entry : lstate.cursors) {
 		TakeUnits(context, bind_data, gstate, lstate, entry.first, entry.second);
 	}
 	lstate.slice_idx = 0;
 	lstate.slice_offset = 0;
+	lstate.batch_bytes = 0;
 	lstate.has_batch = true;
-	return true;
+	return SortedMergeBatchResult::LOADED;
+}
+
+static void FinishSortedMergeBatch(ClientContext &context, const SortedMergeBindData &bind_data,
+                                   SortedMergeGlobalState &gstate, SortedMergeLocalState &lstate) {
+	idx_t batch_rows = 0;
+	for (auto &slice : lstate.slices) {
+		batch_rows += slice.row_count;
+	}
+	// release the decode units of the batch
+	lstate.cursors.clear();
+	lstate.has_batch = false;
+	{
+		annotated_lock_guard<annotated_mutex> guard(gstate.lock);
+		gstate.batches_in_flight--;
+		if (batch_rows >= bind_data.row_group_size) {
+			gstate.batch_bytes =
+			    gstate.batch_bytes == 0
+			        ? lstate.batch_bytes
+			        : (gstate.batch_bytes * (BATCH_BYTES_WEIGHT - 1) + lstate.batch_bytes) / BATCH_BYTES_WEIGHT;
+		}
+	}
+	WakeParkedWorkers(gstate);
+}
+
+//! The bytes the sink's collection takes for these rows: the fixed-size values and the strings stored out of line
+static idx_t SinkBytes(const DataChunk &chunk, idx_t start) {
+	idx_t result = 0;
+	for (auto &vector : chunk.data) {
+		auto physical_type = vector.GetType().InternalType();
+		result += GetTypeIdSize(physical_type) * (chunk.size() - start);
+		if (physical_type != PhysicalType::VARCHAR) {
+			continue;
+		}
+		auto values = vector.Values<string_t>();
+		for (idx_t row = start; row < chunk.size(); row++) {
+			auto entry = values[row];
+			if (entry.IsValid() && !entry.GetValueUnsafe().IsInlined()) {
+				result += entry.GetValueUnsafe().GetSize();
+			}
+		}
+	}
+	return result;
 }
 
 //! Position the cursor at the next row to read, returns the rows available in its current chunk
@@ -473,6 +577,7 @@ static idx_t PositionCursor(SortedMergeInputCursor &cursor, const DuckLakeMergeS
 }
 
 static void EmitSortedMergeRows(SortedMergeLocalState &lstate, DataChunk &output) {
+	auto start = output.size();
 	SelectionVector sel(STANDARD_VECTOR_SIZE);
 	while (output.size() < STANDARD_VECTOR_SIZE && lstate.slice_idx < lstate.slices.size()) {
 		auto &slice = lstate.slices[lstate.slice_idx];
@@ -498,36 +603,140 @@ static void EmitSortedMergeRows(SortedMergeLocalState &lstate, DataChunk &output
 			lstate.slice_offset = 0;
 		}
 	}
+	lstate.batch_bytes += SinkBytes(output, start);
 }
 
-static void DuckLakeSortedMergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
-	auto &bind_data = data.bind_data->Cast<SortedMergeBindData>();
-	auto &gstate = data.global_state->Cast<SortedMergeGlobalState>();
-	auto &lstate = data.local_state->Cast<SortedMergeLocalState>();
-	while (output.size() == 0) {
-		if (!lstate.has_batch && !LoadSortedMergeBatch(context, bind_data, gstate, lstate)) {
-			return;
-		}
-		EmitSortedMergeRows(lstate, output);
-		if (lstate.slice_idx == lstate.slices.size()) {
-			// release the decode units of the batch
-			lstate.cursors.clear();
-			lstate.has_batch = false;
-		}
+//===--------------------------------------------------------------------===//
+// Sorted Merge Source
+//===--------------------------------------------------------------------===//
+class DuckLakeSortedMergeSource : public PhysicalOperator {
+public:
+	DuckLakeSortedMergeSource(PhysicalPlan &physical_plan, const vector<LogicalType> &types,
+	                          shared_ptr<SortedMergeBindData> bind_data_p)
+	    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, types, 0),
+	      bind_data(std::move(bind_data_p)) {
 	}
-}
 
-static OperatorPartitionData DuckLakeSortedMergePartitionData(ClientContext &context,
-                                                              TableFunctionGetPartitionInput &input) {
-	return OperatorPartitionData(input.local_state->Cast<SortedMergeLocalState>().batch_index);
+	shared_ptr<SortedMergeBindData> bind_data;
+
+public:
+	bool IsSource() const override {
+		return true;
+	}
+
+	bool ParallelSource() const override {
+		return true;
+	}
+
+	bool SupportsPartitioning(const OperatorPartitionInfo &partition_info) const override {
+		return !partition_info.RequiresPartitionColumns();
+	}
+
+	unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context,
+	                                                   const OperatorPartitionInfo &partition_info) const override {
+		auto result = InitSortedMergeGlobal(context, *bind_data);
+		result->requires_batch_index = partition_info.RequiresBatchIndex();
+		return std::move(result);
+	}
+
+	unique_ptr<LocalSourceState> GetLocalSourceState(ExecutionContext &context,
+	                                                 GlobalSourceState &gstate) const override {
+		return InitSortedMergeLocal(*bind_data, gstate.Cast<SortedMergeGlobalState>());
+	}
+
+	OperatorPartitionData GetPartitionData(ExecutionContext &context, DataChunk &chunk, GlobalSourceState &gstate,
+	                                       LocalSourceState &lstate,
+	                                       const OperatorPartitionInfo &partition_info) const override {
+		return OperatorPartitionData(lstate.Cast<SortedMergeLocalState>().batch_index);
+	}
+
+	string GetName() const override {
+		return "DUCKLAKE_SORTED_MERGE";
+	}
+
+protected:
+	SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk,
+	                                 OperatorSourceInput &input) const override {
+		auto &gstate = input.global_state.Cast<SortedMergeGlobalState>();
+		auto &lstate = input.local_state.Cast<SortedMergeLocalState>();
+		while (chunk.size() == 0) {
+			if (!lstate.has_batch) {
+				switch (LoadSortedMergeBatch(context.client, *bind_data, gstate, lstate, input)) {
+				case SortedMergeBatchResult::FINISHED:
+					return SourceResultType::FINISHED;
+				case SortedMergeBatchResult::PARKED:
+					return SourceResultType::BLOCKED;
+				case SortedMergeBatchResult::LOADED:
+					break;
+				}
+			}
+			EmitSortedMergeRows(lstate, chunk);
+			if (lstate.slice_idx == lstate.slices.size()) {
+				FinishSortedMergeBatch(context.client, *bind_data, gstate, lstate);
+			}
+		}
+		return SourceResultType::HAVE_MORE_OUTPUT;
+	}
+};
+
+class DuckLakeLogicalSortedMerge : public LogicalExtensionOperator {
+public:
+	DuckLakeLogicalSortedMerge(TableIndex table_index, shared_ptr<SortedMergeBindData> bind_data_p,
+	                           vector<LogicalType> result_types)
+	    : table_index(table_index), bind_data(std::move(bind_data_p)), result_types(std::move(result_types)) {
+	}
+
+	TableIndex table_index;
+	shared_ptr<SortedMergeBindData> bind_data;
+	vector<LogicalType> result_types;
+
+public:
+	PhysicalOperator &CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) override {
+		return planner.Make<DuckLakeSortedMergeSource>(types, bind_data);
+	}
+
+	string GetName() const override {
+		return "DUCKLAKE_SORTED_MERGE";
+	}
+
+	string GetExtensionName() const override {
+		return "ducklake";
+	}
+
+	vector<ColumnBinding> GetColumnBindings() override {
+		return GenerateColumnBindings(table_index, result_types.size());
+	}
+
+	void ResolveTypes() override {
+		types = result_types;
+	}
+};
+
+static unique_ptr<LogicalOperator> DuckLakeSortedMergeBind(ClientContext &context, TableFunctionBindInput &input,
+                                                           TableIndex bind_index, vector<Identifier> &return_names) {
+	vector<DuckLakeFileListEntry> files;
+	idx_t row_group_size;
+	auto &table = BindSortedMergeTable(context, input, files, row_group_size);
+	vector<LogicalType> return_types;
+	for (auto &column : table.GetColumns().Physical()) {
+		return_names.push_back(column.GetName());
+		return_types.push_back(column.Type());
+	}
+	auto bind_data = make_shared_ptr<SortedMergeBindData>(table);
+	bind_data->files = std::move(files);
+	bind_data->row_group_size = row_group_size;
+	Value decode_unit_size;
+	if (DuckLakeTableFunctionUtil::TryGetNonNullOption(input, "decode_unit_size", "integer", decode_unit_size)) {
+		bind_data->decode_unit_size = NumericCast<idx_t>(MaxValue<int64_t>(decode_unit_size.GetValue<int64_t>(), 1));
+	}
+	return make_uniq<DuckLakeLogicalSortedMerge>(bind_index, std::move(bind_data), std::move(return_types));
 }
 
 DuckLakeSortedMergeFunction::DuckLakeSortedMergeFunction()
     : TableFunction("ducklake_sorted_merge", FunctionSignature().AddPositionalOnly("catalog", LogicalType::VARCHAR),
-                    DuckLakeSortedMergeExecute, DuckLakeSortedMergeBind, DuckLakeSortedMergeInitGlobal,
-                    DuckLakeSortedMergeInitLocal) {
+                    nullptr, nullptr, nullptr) {
 	AddSortedMergeArguments(GetSignature());
-	get_partition_data = DuckLakeSortedMergePartitionData;
+	bind_operator = DuckLakeSortedMergeBind;
 }
 
 } // namespace duckdb
