@@ -58,6 +58,7 @@ struct DuckLakeCommitState {
 	map<SchemaIndex, SchemaIndex> committed_schemas;
 	map<TableIndex, TableIndex> committed_tables;
 	map<idx_t, idx_t> committed_partition_ids;
+	map<idx_t, idx_t> committed_sort_ids;
 	map<MappingIndex, MappingIndex> committed_mapping_indexes;
 	map<TableIndex, vector<DuckLakeDeleteFile>> local_delete_files;
 
@@ -80,6 +81,18 @@ struct DuckLakeCommitState {
 		auto entry = committed_partition_ids.find(partition_id.GetIndex());
 		if (entry != committed_partition_ids.end()) {
 			partition_id = entry->second;
+		}
+	}
+	void RemapSortId(optional_idx &sort_id) const {
+		if (!sort_id.IsValid()) {
+			return;
+		}
+		auto entry = committed_sort_ids.find(sort_id.GetIndex());
+		if (entry != committed_sort_ids.end()) {
+			sort_id = entry->second;
+		} else if (sort_id.GetIndex() >= DuckLakeConstants::TRANSACTION_LOCAL_ID_START) {
+			// the sort was replaced later in the transaction and is never committed
+			sort_id = optional_idx();
 		}
 	}
 	void RemapMappingIndex(MappingIndex &table_id) const {

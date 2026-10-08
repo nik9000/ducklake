@@ -269,17 +269,26 @@ WHERE f.table_id = getvariable('chain_winner_id') AND f.partition_id IS NOT NULL
 ----
 0
 
-# exactly one sort_info row (the last ALTER's)
-query I
-SELECT count(*) FROM ducklake_meta.ducklake_sort_info
-WHERE table_id = getvariable('chain_winner_id')
+# two sort_info rows, the closed CREATE sort (begin = end) and the open ALTER sort
+query III
+SELECT count(*), count(*) FILTER (WHERE end_snapshot IS NULL), count(*) FILTER (WHERE begin_snapshot = end_snapshot)
+FROM ducklake_meta.ducklake_sort_info WHERE table_id = getvariable('chain_winner_id')
 ----
-1
+2	1	1
+
+# every data file sort_id references a sort present in sort_info (the closed row keeps them resolvable)
+query I
+SELECT count(*) FROM ducklake_meta.ducklake_data_file f
+WHERE f.table_id = getvariable('chain_winner_id') AND f.sort_id IS NOT NULL
+  AND f.sort_id NOT IN (SELECT sort_id FROM ducklake_meta.ducklake_sort_info WHERE table_id = f.table_id)
+----
+0
 
 # the surviving sort row is `b DESC`, not the inline `a ASC`
 query III
 SELECT expression, sort_direction, null_order FROM ducklake_meta.ducklake_sort_expression
 WHERE table_id = getvariable('chain_winner_id')
+  AND sort_id = (SELECT sort_id FROM ducklake_meta.ducklake_sort_info WHERE table_id = getvariable('chain_winner_id') AND end_snapshot IS NULL)
 ----
 b	DESC	NULLS_LAST
 

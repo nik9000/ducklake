@@ -1,0 +1,227 @@
+# name: test/sql/sorted_table/data_file_sort_id.test
+# description: data files record the sort they were written sorted by
+# group: [sorted_table]
+
+require ducklake
+
+require parquet
+
+test-env DUCKLAKE_CONNECTION {TEST_DIR}/{UUID}.db
+
+test-env DATA_PATH {TEST_DIR}
+
+statement ok
+ATTACH 'ducklake:{DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '{DATA_PATH}/data_file_sort_id', METADATA_CATALOG 'dl', DATA_INLINING_ROW_LIMIT 10)
+
+statement ok
+CALL ducklake.set_option('write_deletion_vectors', 'false')
+
+# for each live data file of a table: no sort recorded, or the table's current sort
+statement ok
+CREATE MACRO file_sorts(tbl) AS TABLE
+SELECT CASE WHEN d.sort_id IS NULL THEN 'none' WHEN d.sort_id = s.sort_id THEN 'current' ELSE 'other' END AS sort
+FROM dl.ducklake_data_file d
+JOIN dl.ducklake_table t ON t.table_id = d.table_id AND t.end_snapshot IS NULL
+LEFT JOIN dl.ducklake_sort_info s ON s.table_id = d.table_id AND s.end_snapshot IS NULL
+WHERE t.table_name = tbl AND d.end_snapshot IS NULL
+ORDER BY d.data_file_id
+
+# no sort key
+statement ok
+CREATE TABLE ducklake.unsorted (i INTEGER)
+
+statement ok
+INSERT INTO ducklake.unsorted FROM range(100)
+
+query I
+FROM file_sorts('unsorted')
+----
+none
+
+# a sorted insert records the sort, an earlier unsorted file does not
+statement ok
+CREATE TABLE ducklake.t (i INTEGER)
+
+statement ok
+INSERT INTO ducklake.t FROM range(100)
+
+statement ok
+ALTER TABLE ducklake.t SET SORTED BY (i)
+
+statement ok
+INSERT INTO ducklake.t FROM range(100, 200)
+
+query I
+FROM file_sorts('t')
+----
+none
+current
+
+# after the sort changes, files written under the old sort keep its id
+statement ok
+ALTER TABLE ducklake.t SET SORTED BY (i DESC)
+
+statement ok
+INSERT INTO ducklake.t FROM range(200, 300)
+
+query I
+FROM file_sorts('t')
+----
+none
+other
+current
+
+# sort set in the same transaction as the insert: the id is remapped at commit
+statement ok
+CREATE TABLE ducklake.same_txn (i INTEGER)
+
+statement ok
+BEGIN
+
+statement ok
+ALTER TABLE ducklake.same_txn SET SORTED BY (i)
+
+statement ok
+INSERT INTO ducklake.same_txn FROM range(100)
+
+statement ok
+COMMIT
+
+query I
+FROM file_sorts('same_txn')
+----
+current
+
+# a sort replaced later in the same transaction is kept for the files written under it
+statement ok
+CREATE TABLE ducklake.replaced (i INTEGER, j INTEGER)
+
+statement ok
+BEGIN
+
+statement ok
+ALTER TABLE ducklake.replaced SET SORTED BY (i)
+
+statement ok
+INSERT INTO ducklake.replaced SELECT r, -r FROM range(100) t(r)
+
+statement ok
+ALTER TABLE ducklake.replaced SET SORTED BY (j)
+
+statement ok
+INSERT INTO ducklake.replaced SELECT r, -r FROM range(100, 200) t(r)
+
+statement ok
+COMMIT
+
+query I
+FROM file_sorts('replaced')
+----
+other
+current
+
+query III
+SELECT e.expression, s.begin_snapshot = s.end_snapshot, s.end_snapshot IS NULL
+FROM dl.ducklake_data_file d
+JOIN dl.ducklake_sort_info s USING (sort_id)
+JOIN dl.ducklake_sort_expression e USING (sort_id)
+WHERE d.table_id = (SELECT table_id FROM dl.ducklake_table WHERE table_name = 'replaced')
+ORDER BY d.data_file_id
+----
+i	true	false
+j	NULL	true
+
+# CREATE TABLE AS with an inline sort
+statement ok
+CREATE TABLE ducklake.ctas SORTED BY (i) AS SELECT 99 - range AS i FROM range(100)
+
+query I
+FROM file_sorts('ctas')
+----
+current
+
+# an update does not sort the rows it writes
+statement ok
+UPDATE ducklake.ctas SET i = i + 1000 WHERE i < 50
+
+query I
+FROM file_sorts('ctas')
+----
+current
+none
+
+# with sort_on_insert disabled, only rows that overflow inlining are sorted
+statement ok
+CREATE TABLE ducklake.no_sort_on_insert (i INTEGER)
+
+statement ok
+ALTER TABLE ducklake.no_sort_on_insert SET SORTED BY (i)
+
+statement ok
+CALL ducklake_set_option('ducklake', 'sort_on_insert', 'false', table_name => 'no_sort_on_insert')
+
+statement ok
+INSERT INTO ducklake.no_sort_on_insert SELECT 99 - range FROM range(100)
+
+statement ok
+CALL ducklake_set_option('ducklake', 'data_inlining_row_limit', 0, table_name => 'no_sort_on_insert')
+
+statement ok
+INSERT INTO ducklake.no_sort_on_insert SELECT 99 - range FROM range(100)
+
+query I
+FROM file_sorts('no_sort_on_insert')
+----
+current
+none
+
+# merging adjacent files writes the merged file sorted
+statement ok
+CREATE TABLE ducklake.merged (i INTEGER)
+
+statement ok
+INSERT INTO ducklake.merged FROM range(100)
+
+statement ok
+ALTER TABLE ducklake.merged SET SORTED BY (i)
+
+statement ok
+INSERT INTO ducklake.merged FROM range(100, 200)
+
+statement ok
+CALL ducklake_merge_adjacent_files('ducklake', 'merged')
+
+query I
+FROM file_sorts('merged')
+----
+current
+
+# rewriting files with deletes does not keep the sorted order, so it records none
+statement ok
+DELETE FROM ducklake.merged WHERE i % 2 = 0
+
+statement ok
+CALL ducklake_rewrite_data_files('ducklake', 'merged', delete_threshold := 0)
+
+query I
+FROM file_sorts('merged')
+----
+none
+
+# flushed inlined data records none
+statement ok
+CREATE TABLE ducklake.flushed (i INTEGER)
+
+statement ok
+ALTER TABLE ducklake.flushed SET SORTED BY (i)
+
+statement ok
+INSERT INTO ducklake.flushed VALUES (3), (1), (2)
+
+statement ok
+CALL ducklake_flush_inlined_data('ducklake', table_name => 'flushed')
+
+query I
+FROM file_sorts('flushed')
+----
+none

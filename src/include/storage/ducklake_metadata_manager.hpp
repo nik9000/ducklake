@@ -648,6 +648,8 @@ private:
 public:
 	//! Read inlined file deletions for regular table scans (no snapshot info per row)
 	map<idx_t, set<idx_t>> ReadInlinedFileDeletions(TableIndex table_id, DuckLakeSnapshot snapshot);
+	//! The sort each live data file of a table was written sorted by, for files that record one
+	map<DataFileIndex, idx_t> ReadDataFileSortIds(TableIndex table_id, DuckLakeSnapshot snapshot);
 	//! Clear inlined table caches (needed after rollback so retry re-creates the tables)
 	void ClearInlinedTableCaches();
 

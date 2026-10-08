@@ -32,6 +32,8 @@ public:
 	vector<Value> partition_values;
 	optional_idx row_id_start;
 	CompactionType type;
+	//! The sort the written files are sorted by (if any)
+	optional_idx sort_id;
 
 public:
 	// // Source interface

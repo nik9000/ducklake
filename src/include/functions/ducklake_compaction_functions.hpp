@@ -49,12 +49,17 @@ public:
 	vector<Value> partition_values;
 	optional_idx row_id_start;
 	CompactionType type;
+	//! The sort the written files are sorted by (if any)
+	optional_idx sort_id;
 
 public:
 	PhysicalOperator &CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) override {
 		auto &child = planner.CreatePlan(*children[0]);
-		return planner.Make<DuckLakeCompaction>(types, table, std::move(source_files), std::move(encryption_key),
-		                                        partition_id, std::move(partition_values), row_id_start, child, type);
+		auto &compaction =
+		    planner.Make<DuckLakeCompaction>(types, table, std::move(source_files), std::move(encryption_key),
+		                                     partition_id, std::move(partition_values), row_id_start, child, type);
+		compaction.Cast<DuckLakeCompaction>().sort_id = sort_id;
+		return compaction;
 	}
 
 	string GetName() const override {

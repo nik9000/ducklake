@@ -10,6 +10,18 @@
 
 namespace duckdb {
 
+optional_idx DuckLakeSort::WrittenSortId() const {
+	if (fields.empty()) {
+		return optional_idx();
+	}
+	for (auto &field : fields) {
+		if (field.dialect != "duckdb") {
+			return optional_idx();
+		}
+	}
+	return sort_id;
+}
+
 //! Replace the column references of a sort expression with the inlined column of the same field
 static void MapToInlinedColumns(unique_ptr<ParsedExpression> &expr, const DuckLakeTableEntry &current_table,
                                 const DuckLakeTableEntry &inlined_table) {

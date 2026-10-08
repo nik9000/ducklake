@@ -95,6 +95,12 @@ static void LoadInternal(ExtensionLoader &loader) {
 	DuckLakeListFilesFunction list_files;
 	loader.RegisterFunction(list_files);
 
+	DuckLakeSortedMergePlanFunction sorted_merge_plan;
+	loader.RegisterFunction(sorted_merge_plan);
+
+	DuckLakeSortedMergeFunction sorted_merge;
+	loader.RegisterFunction(sorted_merge);
+
 	auto add_files = DuckLakeAddDataFilesFunction::GetFunctions();
 	loader.RegisterFunction(add_files);
 

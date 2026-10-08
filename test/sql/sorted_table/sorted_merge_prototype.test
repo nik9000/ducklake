@@ -1,0 +1,359 @@
+# name: test/sql/sorted_table/sorted_merge_prototype.test
+# description: k-way merge of files that are each sorted on the table's sort key
+# group: [sorted_table]
+
+require ducklake
+
+require parquet
+
+test-env DUCKLAKE_CONNECTION {TEST_DIR}/{UUID}.db
+
+statement ok
+ATTACH 'ducklake:{DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '{TEST_DIR}/sorted_merge_prototype/', DATA_INLINING_ROW_LIMIT 0)
+
+statement ok
+SET threads=4
+
+# no sort key
+statement ok
+CREATE TABLE ducklake.unsorted (k INTEGER)
+
+statement error
+FROM ducklake_sorted_merge('ducklake', 'unsorted')
+----
+has no sort key
+
+# two interleaved files and one disjoint file
+statement ok
+CREATE TABLE ducklake.t (k INTEGER, v VARCHAR)
+
+statement ok
+ALTER TABLE ducklake.t SET SORTED BY (k)
+
+statement ok
+INSERT INTO ducklake.t SELECT i, 'a' || i FROM range(0, 1000, 3) r(i)
+
+statement ok
+INSERT INTO ducklake.t SELECT i, 'b' || i FROM range(1, 1000, 3) r(i)
+
+statement ok
+INSERT INTO ducklake.t SELECT i, 'c' || i FROM range(2000, 3000) r(i)
+
+# interleaved files alternate every row, the disjoint file is one slice per row group it spans
+query III
+SELECT input_index, count(*), sum(row_count) FROM ducklake_sorted_merge_plan('ducklake', 't', row_group_size := 500)
+GROUP BY ALL ORDER BY ALL
+----
+0	334	334
+1	333	333
+2	3	1000
+
+query II
+SELECT row_group, sum(row_count) FROM ducklake_sorted_merge_plan('ducklake', 't', row_group_size := 500)
+GROUP BY ALL ORDER BY ALL
+----
+0	500
+1	500
+2	500
+3	167
+
+query IIII
+FROM ducklake_sorted_merge_plan('ducklake', 't', row_group_size := 500, summary := true)
+----
+0	500	2	500
+1	168	3	500
+2	1	1	500
+3	1	1	167
+
+statement ok
+CREATE TEMP TABLE merged AS FROM ducklake_sorted_merge('ducklake', 't', row_group_size := 37)
+
+query I
+SELECT count(*) FROM (SELECT rowid, k, v FROM merged) m
+FULL OUTER JOIN (SELECT row_number() OVER (ORDER BY k) - 1 AS rowid, k, v FROM ducklake.t) e USING (rowid)
+WHERE m.k IS DISTINCT FROM e.k OR m.v IS DISTINCT FROM e.v
+----
+0
+
+# the batch copy path writes the merged rows in order
+statement ok
+COPY (FROM ducklake_sorted_merge('ducklake', 't', row_group_size := 37)) TO '{TEST_DIR}/sorted_merge_prototype_out.parquet'
+
+query I
+SELECT count(*) FROM (SELECT file_row_number AS rowid, k, v FROM read_parquet('{TEST_DIR}/sorted_merge_prototype_out.parquet', file_row_number := true)) m
+FULL OUTER JOIN (SELECT row_number() OVER (ORDER BY k) - 1 AS rowid, k, v FROM ducklake.t) e USING (rowid)
+WHERE m.k IS DISTINCT FROM e.k OR m.v IS DISTINCT FROM e.v
+----
+0
+
+# ties across files become one slice per file and key, ordered by file
+statement ok
+CREATE TABLE ducklake.ties (k INTEGER, file INTEGER)
+
+statement ok
+ALTER TABLE ducklake.ties SET SORTED BY (k)
+
+statement ok
+INSERT INTO ducklake.ties VALUES (1, 0), (1, 0), (1, 0), (2, 0), (2, 0)
+
+statement ok
+INSERT INTO ducklake.ties VALUES (1, 1), (1, 1), (2, 1), (2, 1), (3, 1)
+
+query III
+SELECT input_index, row_start, row_count FROM ducklake_sorted_merge_plan('ducklake', 'ties')
+----
+0	0	3
+1	0	2
+0	3	2
+1	2	3
+
+query II
+FROM ducklake_sorted_merge('ducklake', 'ties')
+----
+1	0
+1	0
+1	0
+1	1
+1	1
+2	0
+2	0
+2	1
+2	1
+3	1
+
+# keys longer than the 16-byte prefix mixed with short keys
+statement ok
+CREATE TABLE ducklake.long_keys (s VARCHAR, id INTEGER)
+
+statement ok
+ALTER TABLE ducklake.long_keys SET SORTED BY (s)
+
+loop i 0 3
+
+statement ok
+INSERT INTO ducklake.long_keys
+SELECT CASE r % 4
+	WHEN 0 THEN 'a_shared_prefix_longer_than_sixteen_bytes_' || lpad(((r * 7 + {i}) % 500)::VARCHAR, 4, '0')
+	WHEN 1 THEN 'ab'
+	WHEN 2 THEN 'ab '
+	ELSE 'a_shared_prefix_longer_than_sixteen_bytes_' || lpad(((r * 7 + {i}) % 500)::VARCHAR, 4, '0') || '_tail'
+	END, {i} * 1000 + r
+FROM range(400) t(r)
+
+endloop
+
+statement ok
+CREATE TEMP TABLE merged_long_keys AS FROM ducklake_sorted_merge('ducklake', 'long_keys', row_group_size := 50)
+
+query I
+SELECT count(*) FROM (SELECT rowid, s FROM merged_long_keys) m
+FULL OUTER JOIN (SELECT row_number() OVER (ORDER BY s) - 1 AS rowid, s FROM ducklake.long_keys) e USING (rowid)
+WHERE m.s IS DISTINCT FROM e.s
+----
+0
+
+query I
+SELECT count(*) FROM ((FROM merged_long_keys EXCEPT ALL FROM ducklake.long_keys) UNION ALL (FROM ducklake.long_keys EXCEPT ALL FROM merged_long_keys))
+----
+0
+
+# multi-column key with DESC and NULLS FIRST
+statement ok
+CREATE TABLE ducklake.multi (a INTEGER, b VARCHAR, id INTEGER)
+
+statement ok
+ALTER TABLE ducklake.multi SET SORTED BY (a DESC NULLS FIRST, b ASC NULLS LAST)
+
+loop i 0 5
+
+statement ok
+INSERT INTO ducklake.multi
+SELECT CASE WHEN r % 17 = 0 THEN NULL ELSE (r * 7 + {i}) % 13 END, CASE WHEN r % 11 = 0 THEN NULL ELSE 'x' || (r % 5) END, {i} * 1000 + r
+FROM range(300) t(r)
+
+endloop
+
+statement ok
+CREATE TEMP TABLE merged_multi AS FROM ducklake_sorted_merge('ducklake', 'multi', row_group_size := 100)
+
+query I
+SELECT count(*) FROM (SELECT rowid, a, b FROM merged_multi) m
+FULL OUTER JOIN (SELECT row_number() OVER (ORDER BY a DESC NULLS FIRST, b ASC NULLS LAST) - 1 AS rowid, a, b FROM ducklake.multi) e USING (rowid)
+WHERE m.a IS DISTINCT FROM e.a OR m.b IS DISTINCT FROM e.b
+----
+0
+
+query I
+SELECT count(*) FROM ((FROM merged_multi EXCEPT ALL FROM ducklake.multi) UNION ALL (FROM ducklake.multi EXCEPT ALL FROM merged_multi))
+----
+0
+
+# expression sort key, merged after the column is renamed
+statement ok
+CREATE TABLE ducklake.expr (ts TIMESTAMP, id INTEGER)
+
+statement ok
+ALTER TABLE ducklake.expr SET SORTED BY (date_trunc('hour', ts), id)
+
+loop i 0 4
+
+statement ok
+INSERT INTO ducklake.expr SELECT TIMESTAMP '2026-01-01' + INTERVAL (r * 37 + {i} * 11) MINUTE, {i} * 1000 + r FROM range(200) t(r)
+
+endloop
+
+statement ok
+ALTER TABLE ducklake.expr RENAME COLUMN ts TO event_time
+
+statement ok
+CREATE TEMP TABLE merged_expr AS FROM ducklake_sorted_merge('ducklake', 'expr', row_group_size := 64)
+
+query I
+SELECT count(*) FROM (SELECT rowid, event_time, id FROM merged_expr) m
+FULL OUTER JOIN (SELECT row_number() OVER (ORDER BY date_trunc('hour', event_time), id) - 1 AS rowid, event_time, id FROM ducklake.expr) e USING (rowid)
+WHERE m.event_time IS DISTINCT FROM e.event_time OR m.id IS DISTINCT FROM e.id
+----
+0
+
+# deleted rows are skipped
+statement ok
+DELETE FROM ducklake.t WHERE k % 5 = 0
+
+statement ok
+CREATE TEMP TABLE merged_deletes AS FROM ducklake_sorted_merge('ducklake', 't', row_group_size := 37)
+
+query I
+SELECT count(*) FROM (SELECT rowid, k, v FROM merged_deletes) m
+FULL OUTER JOIN (SELECT row_number() OVER (ORDER BY k) - 1 AS rowid, k, v FROM ducklake.t) e USING (rowid)
+WHERE m.k IS DISTINCT FROM e.k OR m.v IS DISTINCT FROM e.v
+----
+0
+
+query I
+SELECT sum(row_end - row_start) > sum(row_count) FROM ducklake_sorted_merge_plan('ducklake', 't', row_group_size := 37)
+----
+true
+
+# a file written before the table was sorted is detected
+statement ok
+CREATE TABLE ducklake.late_sort (k INTEGER)
+
+statement ok
+INSERT INTO ducklake.late_sort SELECT (r * 7919) % 1000 FROM range(1000) t(r)
+
+statement ok
+ALTER TABLE ducklake.late_sort SET SORTED BY (k)
+
+statement error
+FROM ducklake_sorted_merge('ducklake', 'late_sort')
+----
+is not sorted on the sort key
+
+# a file the catalog records as sorted on the current sort is trusted without verification
+statement ok
+UPDATE __ducklake_metadata_ducklake.ducklake_data_file
+SET sort_id = (SELECT sort_id FROM __ducklake_metadata_ducklake.ducklake_sort_info
+               WHERE table_id = ducklake_data_file.table_id AND end_snapshot IS NULL)
+WHERE table_id = (SELECT table_id FROM __ducklake_metadata_ducklake.ducklake_table WHERE table_name = 'late_sort')
+
+query I
+SELECT count(*) FROM ducklake_sorted_merge('ducklake', 'late_sort')
+----
+1000
+
+# a file sorted on an older sort is verified against the current one
+statement ok
+CREATE TABLE ducklake.resorted (k INTEGER)
+
+statement ok
+ALTER TABLE ducklake.resorted SET SORTED BY (k)
+
+statement ok
+INSERT INTO ducklake.resorted FROM range(1000)
+
+statement ok
+ALTER TABLE ducklake.resorted SET SORTED BY (k DESC)
+
+statement error
+FROM ducklake_sorted_merge('ducklake', 'resorted')
+----
+is not sorted on the sort key
+
+# larger interleaved inputs with deletes, read by batches of several sizes
+statement ok
+CREATE TABLE ducklake.units (k INTEGER, s VARCHAR)
+
+statement ok
+ALTER TABLE ducklake.units SET SORTED BY (k)
+
+loop i 0 3
+
+statement ok
+INSERT INTO ducklake.units SELECT r * 3 + {i}, repeat('payload_', 3) || (r * 3 + {i}) FROM range(10000) t(r)
+
+endloop
+
+statement ok
+DELETE FROM ducklake.units WHERE k % 11 = 0
+
+statement ok
+CREATE TEMP TABLE merged_units AS FROM ducklake_sorted_merge('ducklake', 'units', row_group_size := 1500)
+
+query I
+SELECT count(*) FROM (SELECT rowid, k, s FROM merged_units) m
+FULL OUTER JOIN (SELECT row_number() OVER (ORDER BY k) - 1 AS rowid, k, s FROM ducklake.units) e USING (rowid)
+WHERE m.k IS DISTINCT FROM e.k OR m.s IS DISTINCT FROM e.s
+----
+0
+
+# decode units of one scanned chunk, each shared by several batches
+statement ok
+CREATE TEMP TABLE merged_tiny_units AS FROM ducklake_sorted_merge('ducklake', 'units', row_group_size := 1500, decode_unit_size := 1)
+
+query I
+SELECT count(*) FROM (SELECT rowid, k, s FROM merged_tiny_units) m
+FULL OUTER JOIN (SELECT row_number() OVER (ORDER BY k) - 1 AS rowid, k, s FROM ducklake.units) e USING (rowid)
+WHERE m.k IS DISTINCT FROM e.k OR m.s IS DISTINCT FROM e.s
+----
+0
+
+# batches larger than a unit
+statement ok
+CREATE TEMP TABLE merged_units_large AS FROM ducklake_sorted_merge('ducklake', 'units', row_group_size := 20000)
+
+query I
+SELECT count(*) FROM (SELECT rowid, k, s FROM merged_units_large) m
+FULL OUTER JOIN (SELECT row_number() OVER (ORDER BY k) - 1 AS rowid, k, s FROM ducklake.units) e USING (rowid)
+WHERE m.k IS DISTINCT FROM e.k OR m.s IS DISTINCT FROM e.s
+----
+0
+
+statement ok
+CREATE TEMP TABLE merged_units_small_batches AS FROM ducklake_sorted_merge('ducklake', 'units', row_group_size := 100)
+
+query I
+SELECT count(*) FROM (SELECT rowid, k, s FROM merged_units_small_batches) m
+FULL OUTER JOIN (SELECT row_number() OVER (ORDER BY k) - 1 AS rowid, k, s FROM ducklake.units) e USING (rowid)
+WHERE m.k IS DISTINCT FROM e.k OR m.s IS DISTINCT FROM e.s
+----
+0
+
+# under a small memory limit
+statement ok
+SET memory_limit = '30MB'
+
+statement ok
+SET threads = 8
+
+statement ok
+CREATE TEMP TABLE merged_units_limited AS FROM ducklake_sorted_merge('ducklake', 'units', row_group_size := 500)
+
+statement ok
+RESET memory_limit
+
+query I
+SELECT count(*) FROM (SELECT rowid, k, s FROM merged_units_limited) m
+FULL OUTER JOIN (SELECT row_number() OVER (ORDER BY k) - 1 AS rowid, k, s FROM ducklake.units) e USING (rowid)
+WHERE m.k IS DISTINCT FROM e.k OR m.s IS DISTINCT FROM e.s
+----
+0

@@ -491,6 +491,7 @@ DuckLakeFileInfo DuckLakeTransactionState::GetNewDataFile(const DuckLakeDataFile
 	    data_file.partition_id.GetIndex() >= DuckLakeConstants::TRANSACTION_LOCAL_ID_START) {
 		throw InternalException("Cannot commit data file with transaction-local partition id");
 	}
+	commit_state.RemapSortId(data_file.sort_id);
 	commit_state.RemapMappingIndex(data_file.mapping_id);
 	return data_file;
 }

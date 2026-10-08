@@ -166,6 +166,7 @@ struct DuckLakeFileInfo {
 	optional_idx row_group_count;
 	optional_idx row_id_start;
 	optional_idx partition_id;
+	optional_idx sort_id;
 	optional_idx begin_snapshot;
 	optional_idx max_partial_file_snapshot;
 	string encryption_key;
@@ -469,6 +470,8 @@ struct DuckLakeCompactionFileData : public DuckLakeCompactionBaseFileData {
 	optional_idx row_id_start;
 	MappingIndex mapping_id;
 	optional_idx partition_id;
+	//! The sort the file was written sorted by
+	optional_idx sort_id;
 	vector<Value> partition_values;
 };
 

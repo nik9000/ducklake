@@ -103,7 +103,7 @@ unique_ptr<GlobalSinkState> DuckLakeCompaction::GetGlobalSinkState(ClientContext
 
 SinkResultType DuckLakeCompaction::Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const {
 	auto &global_state = input.global_state.Cast<DuckLakeInsertGlobalState>();
-	DuckLakeInsert::AddWrittenFiles(global_state, chunk, encryption_key, partition_id);
+	DuckLakeInsert::AddWrittenFiles(global_state, chunk, encryption_key, partition_id, sort_id);
 	return SinkResultType::NEED_MORE_INPUT;
 }
 
@@ -595,13 +595,17 @@ DuckLakeCompactor::GenerateCompactionCommand(vector<DuckLakeCompactionFileEntry>
 
 	auto &latest_table = GetLatestTableEntry(catalog, transaction, table);
 	auto sort_data = latest_table.GetSortData();
+	optional_idx sort_id;
 	if (sort_data) {
 		root = DuckLakeCompactor::InsertSort(binder, root, latest_table, sort_data);
+		sort_id = sort_data->WrittenSortId();
 	}
 
 	copy->table_index = binder.GenerateTableIndex();
 	if (write_row_id) {
 		copy->preserve_order = PreserveOrderType::DONT_PRESERVE_ORDER;
+		// the copy does not keep the sorted order
+		sort_id = optional_idx();
 	} else {
 		auto &fs = FileSystem::GetFileSystem(context);
 		copy->file_path = copy->filename_pattern.CreateFilename(fs, copy->file_path, "parquet", 0);
@@ -622,6 +626,7 @@ DuckLakeCompactor::GenerateCompactionCommand(vector<DuckLakeCompactionFileEntry>
 	auto compaction = make_uniq<DuckLakeLogicalCompaction>(
 	    binder.GenerateTableIndex(), table, std::move(actionable_source_files), std::move(copy_input.encryption_key),
 	    partition_id, std::move(partition_values), target_row_id_start, type);
+	compaction->sort_id = sort_id;
 	compaction->children.push_back(std::move(copy));
 	return std::move(compaction);
 }

@@ -1216,6 +1216,7 @@ unique_ptr<DuckLakeSort> DuckLakeTableEntry::BuildSortData(DuckLakeTransaction &
 	ValidateSortExpressionColumns(columns, orders);
 	auto sort_data = make_uniq<DuckLakeSort>();
 	sort_data->sort_id = transaction.GetLocalCatalogId();
+	sort_data->local_sort_id = sort_data->sort_id;
 	for (idx_t order_node_idx = 0; order_node_idx < orders.size(); order_node_idx++) {
 		auto &order_node = orders[order_node_idx];
 		DuckLakeSortField sort_field;

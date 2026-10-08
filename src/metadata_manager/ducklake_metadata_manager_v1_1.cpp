@@ -19,7 +19,7 @@ string DuckLakeMetadataManagerV1_1<Base>::GetDataFileTableStatement() {
 	       "begin_snapshot BIGINT, end_snapshot BIGINT, file_order BIGINT, path VARCHAR, path_is_relative BOOLEAN, "
 	       "file_format VARCHAR, record_count BIGINT, file_size_bytes BIGINT, footer_size BIGINT, row_id_start BIGINT, "
 	       "partition_id BIGINT, encryption_key VARCHAR, mapping_id BIGINT, partial_max BIGINT, row_group_count "
-	       "BIGINT);";
+	       "BIGINT, sort_id BIGINT);";
 }
 
 template <typename Base>

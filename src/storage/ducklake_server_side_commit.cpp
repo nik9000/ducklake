@@ -274,6 +274,7 @@ void DuckLakeServerSideCommit::ReadStagedDataFiles() {
 		f.max_partial_file_snapshot = OptIdx(row, 13);
 		f.begin_snapshot = OptIdx(row, 14);
 		f.row_group_count = OptIdx(row, 16);
+		f.sort_id = OptIdx(row, 17);
 		TakeIfPresent(per_file_stats, local_file_id, f.column_stats);
 		TakeIfPresent(attached_deletes, local_file_id.index, f.delete_files);
 		TakeIfPresent(partition_values_by_file, local_file_id.index, f.partition_values);

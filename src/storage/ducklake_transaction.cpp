@@ -1020,9 +1020,13 @@ DuckLakeSortInfo DuckLakeTransaction::GetNewSortKey(DuckLakeCommitState &commit_
 		return sort_key;
 	}
 
+	// key the remap off the original transaction-local id: a previous failed commit attempt may have
+	// already overwritten sort_id, while data files still reference the transaction-local id
+	auto local_sort_id = sort_data->local_sort_id.IsValid() ? sort_data->local_sort_id.GetIndex() : sort_data->sort_id;
 	auto sort_id = commit_state.commit_snapshot.next_catalog_id++;
 	sort_key.id = sort_id;
 	sort_data->sort_id = sort_id;
+	commit_state.committed_sort_ids[local_sort_id] = sort_id;
 	for (auto &field : sort_data->fields) {
 		DuckLakeSortFieldInfo sort_field;
 		sort_field.sort_key_index = field.sort_key_index;
@@ -1194,6 +1198,7 @@ DuckLakeFileInfo DuckLakeTransaction::BuildDataFileInfo(const DuckLakeDataFile &
 	data_file.footer_size = file.footer_size;
 	data_file.row_group_count = file.row_group_count;
 	data_file.partition_id = file.partition_id;
+	data_file.sort_id = file.sort_id;
 	data_file.encryption_key = file.encryption_key;
 	data_file.row_id_start = row_id_start;
 	data_file.mapping_id = file.mapping_id;
