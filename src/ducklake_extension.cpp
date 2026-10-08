@@ -101,6 +101,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	DuckLakeSortedMergeFunction sorted_merge;
 	loader.RegisterFunction(sorted_merge);
 
+	DuckLakeSortedMergeWorkerLimitsFunction sorted_merge_worker_limits;
+	loader.RegisterFunction(sorted_merge_worker_limits);
+
 	auto add_files = DuckLakeAddDataFilesFunction::GetFunctions();
 	loader.RegisterFunction(add_files);
 

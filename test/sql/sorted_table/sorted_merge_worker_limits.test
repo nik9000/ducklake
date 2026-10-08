@@ -1,0 +1,66 @@
+# name: test/sql/sorted_table/sorted_merge_worker_limits.test
+# description: the number of workers a sorted merge allows for the decoded size of its batches
+# group: [sorted_table]
+
+require ducklake
+
+# the limit starts at one worker and at most doubles per batch, up to what the memory limit fits
+query II
+SELECT batch, worker_limit FROM ducklake_sorted_merge_worker_limits('8GB', 24, [93000000, 93000000, 93000000, 93000000, 93000000])
+----
+0	2
+1	4
+2	8
+3	10
+4	10
+
+# narrow batches allow every thread, a wide batch drops the limit at once, narrow batches after it raise it slowly
+query III
+SELECT batch, average_batch_bytes, worker_limit
+FROM ducklake_sorted_merge_worker_limits('4GB', 24, [6000000, 6000000, 6000000, 6000000, 6000000, 6000000, 200000000, 200000000, 6000000, 6000000, 6000000, 6000000, 6000000, 6000000])
+----
+0	6000000	2
+1	6000000	4
+2	6000000	8
+3	6000000	16
+4	6000000	24
+5	6000000	24
+6	200000000	2
+7	200000000	2
+8	183833333	2
+9	169013888	2
+10	155429397	3
+11	142976947	3
+12	131562201	3
+13	121098684	4
+
+# batches larger than the memory limit allows still get one worker
+query II
+SELECT batch, worker_limit FROM ducklake_sorted_merge_worker_limits('100MB', 8, [500000000, 500000000])
+----
+0	1
+1	1
+
+# the thread count caps the limit
+query II
+SELECT batch, worker_limit FROM ducklake_sorted_merge_worker_limits('100GB', 4, [1000000, 1000000, 1000000, 1000000])
+----
+0	2
+1	4
+2	4
+3	4
+
+query I
+SELECT count(*) FROM ducklake_sorted_merge_worker_limits('1GB', 4, [])
+----
+0
+
+statement error
+SELECT * FROM ducklake_sorted_merge_worker_limits('1GB', 0, [1000000])
+----
+threads must be positive
+
+statement error
+SELECT * FROM ducklake_sorted_merge_worker_limits('1GB', 4, NULL)
+----
+does not accept NULL arguments

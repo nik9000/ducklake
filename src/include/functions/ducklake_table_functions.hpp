@@ -154,6 +154,11 @@ public:
 	DuckLakeSortedMergeFunction();
 };
 
+class DuckLakeSortedMergeWorkerLimitsFunction : public TableFunction {
+public:
+	DuckLakeSortedMergeWorkerLimitsFunction();
+};
+
 class DuckLakeCurrentSnapshotFunction : public DuckLakeBaseMetadataFunction {
 public:
 	DuckLakeCurrentSnapshotFunction();

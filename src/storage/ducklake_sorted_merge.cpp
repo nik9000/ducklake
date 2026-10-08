@@ -65,6 +65,43 @@ bool DuckLakeSingleFileScanner::Scan(DataChunk &chunk) {
 }
 
 //===--------------------------------------------------------------------===//
+// Worker Policy
+//===--------------------------------------------------------------------===//
+//! Batches a worker keeps in the batch copy, and the fraction of the memory limit the batch copy takes
+static constexpr idx_t BATCHES_PER_WORKER = 2;
+static constexpr idx_t WRITER_MEMORY_FRACTION = 4;
+//! A narrower batch moves the average 1/BATCH_BYTES_DECAY of the way
+static constexpr idx_t BATCH_BYTES_DECAY = 12;
+
+DuckLakeSortedMergeWorkerPolicy::DuckLakeSortedMergeWorkerPolicy(idx_t max_threads)
+    : max_threads(MaxValue<idx_t>(max_threads, 1)) {
+}
+
+void DuckLakeSortedMergeWorkerPolicy::AddBatch(idx_t batch_bytes, idx_t max_memory) {
+	if (batch_bytes >= average_batch_bytes) {
+		average_batch_bytes = batch_bytes;
+	} else {
+		average_batch_bytes = (average_batch_bytes * (BATCH_BYTES_DECAY - 1) + batch_bytes) / BATCH_BYTES_DECAY;
+	}
+	auto target = TargetWorkers(max_memory);
+	limit = target < limit ? target : MinValue(target, limit * 2);
+}
+
+idx_t DuckLakeSortedMergeWorkerPolicy::WorkerLimit(idx_t max_memory) const {
+	if (average_batch_bytes == 0) {
+		// nothing measured yet - one worker measures the first batch
+		return 1;
+	}
+	// the memory limit may have shrunk since the last batch
+	return MinValue(limit, TargetWorkers(max_memory));
+}
+
+idx_t DuckLakeSortedMergeWorkerPolicy::TargetWorkers(idx_t max_memory) const {
+	auto workers = max_memory / (BATCHES_PER_WORKER * WRITER_MEMORY_FRACTION * MaxValue<idx_t>(average_batch_bytes, 1));
+	return MaxValue<idx_t>(1, MinValue(workers, max_threads));
+}
+
+//===--------------------------------------------------------------------===//
 // Merge Planner
 //===--------------------------------------------------------------------===//
 //! Read up to 8 bytes as a big-endian integer, zero-padded on the right

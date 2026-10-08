@@ -3,6 +3,8 @@
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/execution/partition_info.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
+#include "duckdb/logging/logger.hpp"
+#include "duckdb/main/query_profiler.hpp"
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/planner/operator/logical_extension_operator.hpp"
@@ -204,9 +206,17 @@ struct SortedMergeGlobalState : public GlobalSourceState {
 	bool requires_batch_index = false;
 	//! Batches being emitted
 	idx_t batches_in_flight = 0;
-	//! Moving average of the decoded bytes of a full batch, as the sink measures it
-	idx_t batch_bytes = 0;
+	//! Workers allowed from the decoded size of the batches, as the sink measures it
+	unique_ptr<DuckLakeSortedMergeWorkerPolicy> worker_policy;
 	bool planner_exhausted = false;
+	//! For logging and EXPLAIN ANALYZE
+	idx_t worker_limit = 0;
+	//! The range of worker limits once a batch is measured
+	idx_t min_worker_limit = NumericLimits<idx_t>::Maximum();
+	idx_t max_worker_limit = 0;
+	idx_t peak_batches_in_flight = 0;
+	idx_t batches_emitted = 0;
+	idx_t parks = 0;
 	//! Decoded bytes a unit grows to before the next one starts
 	idx_t unit_size_bytes = 0;
 	//! File rows per segment, segments are aligned to row groups of this size
@@ -251,11 +261,6 @@ struct SortedMergeLocalState : public LocalSourceState {
 	DataChunk payload;
 };
 
-//! Batches a worker keeps in the batch copy, and the fraction of the memory limit the batch copy takes
-static constexpr idx_t BATCHES_PER_WORKER = 2;
-static constexpr idx_t WRITER_MEMORY_FRACTION = 4;
-//! Weight of the batch byte average: the latest batch counts 1/BATCH_BYTES_WEIGHT
-static constexpr idx_t BATCH_BYTES_WEIGHT = 4;
 //! Units take at most this fraction of the memory limit across all inputs
 static constexpr idx_t UNIT_MEMORY_FRACTION = 16;
 static constexpr idx_t MIN_UNIT_SIZE_BYTES = 1ULL << 20;
@@ -278,6 +283,7 @@ static unique_ptr<SortedMergeGlobalState> InitSortedMergeGlobal(ClientContext &c
 	}
 	result->segment_size = bind_data.row_group_size;
 	result->max_threads = TaskScheduler::GetScheduler(context).NumberOfThreads();
+	result->worker_policy = make_uniq<DuckLakeSortedMergeWorkerPolicy>(result->max_threads);
 	return std::move(result);
 }
 
@@ -417,19 +423,6 @@ static void TakeUnits(ClientContext &context, const SortedMergeBindData &bind_da
 	}
 }
 
-//! Workers that may emit batches at once. The batch copy takes a quarter of the memory limit and each worker keeps
-//! about two batches in it: one it builds and one waiting to be written in order.
-static idx_t SortedMergeWorkerLimit(ClientContext &context, const SortedMergeGlobalState &gstate)
-    DUCKDB_REQUIRES(gstate.lock) {
-	if (gstate.batch_bytes == 0) {
-		// nothing measured yet - one worker measures the first batch
-		return 1;
-	}
-	auto max_memory = BufferManager::GetBufferManager(context).GetMaxMemory();
-	auto workers = max_memory / (BATCHES_PER_WORKER * WRITER_MEMORY_FRACTION * gstate.batch_bytes);
-	return MaxValue<idx_t>(1, MinValue(workers, gstate.max_threads));
-}
-
 static void WakeParkedWorkers(SortedMergeGlobalState &gstate) {
 	annotated_lock_guard<annotated_mutex> guard(gstate.lock);
 	gstate.UnblockTasks();
@@ -451,8 +444,24 @@ static SortedMergeBatchResult LoadSortedMergeBatch(ClientContext &context, const
                                                    OperatorSourceInput &input) {
 	{
 		annotated_lock_guard<annotated_mutex> guard(gstate.lock);
-		if (!gstate.planner_exhausted && gstate.batches_in_flight >= SortedMergeWorkerLimit(context, gstate) &&
-		    input.interrupt_state.CanCallback()) {
+		auto max_memory = BufferManager::GetBufferManager(context).GetMaxMemory();
+		auto worker_limit = gstate.worker_policy->WorkerLimit(max_memory);
+		if (worker_limit != gstate.worker_limit) {
+			DUCKDB_LOG_DEBUG(context,
+			                 StringUtil::Format("DuckLake sorted merge: %llu workers for batches of %llu bytes "
+			                                    "under a memory limit of %llu bytes",
+			                                    worker_limit, gstate.worker_policy->AverageBatchBytes(), max_memory));
+			gstate.worker_limit = worker_limit;
+			if (gstate.worker_policy->AverageBatchBytes() > 0) {
+				gstate.min_worker_limit = MinValue(gstate.min_worker_limit, worker_limit);
+				gstate.max_worker_limit = MaxValue(gstate.max_worker_limit, worker_limit);
+			}
+		}
+		if (gstate.planner_exhausted) {
+			return SortedMergeBatchResult::FINISHED;
+		}
+		// when the pipeline no longer lets tasks park (it is finishing), the worker goes ahead
+		if (gstate.batches_in_flight >= worker_limit && input.interrupt_state.CanCallback()) {
 			// park at the batch boundary. First report the next batch index the planner hands out, so the sink takes
 			// the finished batch and moves on: every batch below it is done or being emitted by a running worker. The
 			// pipeline calls back right after taking the new index, and that call parks.
@@ -463,10 +472,12 @@ static SortedMergeBatchResult LoadSortedMergeBatch(ClientContext &context, const
 				return SortedMergeBatchResult::PARKED;
 			}
 			if (gstate.BlockTask(input.interrupt_state)) {
+				gstate.parks++;
 				return SortedMergeBatchResult::PARKED;
 			}
 		}
 		gstate.batches_in_flight++;
+		gstate.peak_batches_in_flight = MaxValue(gstate.peak_batches_in_flight, gstate.batches_in_flight);
 	}
 	{
 		lock_guard<mutex> guard(gstate.plan_lock);
@@ -511,8 +522,9 @@ static SortedMergeBatchResult LoadSortedMergeBatch(ClientContext &context, const
 	return SortedMergeBatchResult::LOADED;
 }
 
-static void FinishSortedMergeBatch(ClientContext &context, const SortedMergeBindData &bind_data,
-                                   SortedMergeGlobalState &gstate, SortedMergeLocalState &lstate) {
+static void FinishSortedMergeBatch(ExecutionContext &context, const PhysicalOperator &op,
+                                   const SortedMergeBindData &bind_data, SortedMergeGlobalState &gstate,
+                                   SortedMergeLocalState &lstate) {
 	idx_t batch_rows = 0;
 	for (auto &slice : lstate.slices) {
 		batch_rows += slice.row_count;
@@ -523,11 +535,27 @@ static void FinishSortedMergeBatch(ClientContext &context, const SortedMergeBind
 	{
 		annotated_lock_guard<annotated_mutex> guard(gstate.lock);
 		gstate.batches_in_flight--;
+		gstate.batches_emitted++;
 		if (batch_rows >= bind_data.row_group_size) {
-			gstate.batch_bytes =
-			    gstate.batch_bytes == 0
-			        ? lstate.batch_bytes
-			        : (gstate.batch_bytes * (BATCH_BYTES_WEIGHT - 1) + lstate.batch_bytes) / BATCH_BYTES_WEIGHT;
+			gstate.worker_policy->AddBatch(lstate.batch_bytes,
+			                               BufferManager::GetBufferManager(context.client).GetMaxMemory());
+		}
+		if (QueryProfiler::Get(context.client).IsEnabled()) {
+			// the profiler keeps the extra info of the thread that flushes last, so write the merge-wide numbers
+			InsertionOrderPreservingMap<string> info;
+			info["Worker Limit"] = to_string(gstate.worker_limit);
+			if (gstate.max_worker_limit > 0) {
+				info["Worker Limit Range"] =
+				    to_string(gstate.min_worker_limit) + " - " + to_string(gstate.max_worker_limit);
+			}
+			info["Peak Active Workers"] = to_string(gstate.peak_batches_in_flight);
+			info["Average Batch Bytes"] = to_string(gstate.worker_policy->AverageBatchBytes());
+			info["Batches"] = to_string(gstate.batches_emitted);
+			info["Parks"] = to_string(gstate.parks);
+			info["Decode Unit Bytes"] = to_string(gstate.unit_size_bytes);
+			auto &metrics = context.thread.profiler.GetOperatorMetrics(op);
+			metrics.name = op.GetName();
+			metrics.SetExtraInfo(std::move(info));
 		}
 	}
 	WakeParkedWorkers(gstate);
@@ -672,7 +700,7 @@ protected:
 			}
 			EmitSortedMergeRows(lstate, chunk);
 			if (lstate.slice_idx == lstate.slices.size()) {
-				FinishSortedMergeBatch(context.client, *bind_data, gstate, lstate);
+				FinishSortedMergeBatch(context, *this, *bind_data, gstate, lstate);
 			}
 		}
 		return SourceResultType::HAVE_MORE_OUTPUT;
@@ -730,6 +758,68 @@ static unique_ptr<LogicalOperator> DuckLakeSortedMergeBind(ClientContext &contex
 		bind_data->decode_unit_size = NumericCast<idx_t>(MaxValue<int64_t>(decode_unit_size.GetValue<int64_t>(), 1));
 	}
 	return make_uniq<DuckLakeLogicalSortedMerge>(bind_index, std::move(bind_data), std::move(return_types));
+}
+
+//===--------------------------------------------------------------------===//
+// ducklake_sorted_merge_worker_limits
+//===--------------------------------------------------------------------===//
+static unique_ptr<FunctionData> DuckLakeSortedMergeWorkerLimitsBind(ClientContext &context,
+                                                                    TableFunctionBindInput &input,
+                                                                    vector<LogicalType> &return_types,
+                                                                    vector<Identifier> &names) {
+	for (auto &value : input.inputs) {
+		if (value.IsNull()) {
+			throw BinderException("ducklake_sorted_merge_worker_limits does not accept NULL arguments");
+		}
+	}
+	auto max_memory = DBConfig::ParseMemoryLimit(StringValue::Get(input.inputs[0]));
+	auto threads = input.inputs[1].GetValue<int64_t>();
+	if (threads <= 0) {
+		throw BinderException("threads must be positive");
+	}
+	names.emplace_back("batch");
+	return_types.emplace_back(LogicalType::BIGINT);
+	names.emplace_back("batch_bytes");
+	return_types.emplace_back(LogicalType::BIGINT);
+	names.emplace_back("average_batch_bytes");
+	return_types.emplace_back(LogicalType::BIGINT);
+	names.emplace_back("worker_limit");
+	return_types.emplace_back(LogicalType::BIGINT);
+
+	DuckLakeSortedMergeWorkerPolicy policy(NumericCast<idx_t>(threads));
+	auto result = make_uniq<MetadataBindData>();
+	idx_t batch = 0;
+	for (auto &entry : ListValue::GetChildren(input.inputs[2])) {
+		auto batch_bytes = entry.GetValue<int64_t>();
+		if (batch_bytes < 0) {
+			throw BinderException("batch sizes must not be negative");
+		}
+		policy.AddBatch(NumericCast<idx_t>(batch_bytes), max_memory);
+		vector<Value> row_values;
+		row_values.push_back(Value::BIGINT(NumericCast<int64_t>(batch++)));
+		row_values.push_back(Value::BIGINT(batch_bytes));
+		row_values.push_back(Value::BIGINT(NumericCast<int64_t>(policy.AverageBatchBytes())));
+		row_values.push_back(Value::BIGINT(NumericCast<int64_t>(policy.WorkerLimit(max_memory))));
+		result->rows.push_back(std::move(row_values));
+	}
+	return std::move(result);
+}
+
+static void DuckLakeSortedMergeWorkerLimitsExecute(ClientContext &context, TableFunctionInput &data,
+                                                   DataChunk &output) {
+	auto &bind_data = data.bind_data->Cast<MetadataBindData>();
+	auto &state = data.global_state->Cast<DuckLakeRunOnceState>();
+	DuckLakeBaseMetadataFunction::ScanRows(bind_data.rows, state.offset, output);
+}
+
+DuckLakeSortedMergeWorkerLimitsFunction::DuckLakeSortedMergeWorkerLimitsFunction()
+    : TableFunction("ducklake_sorted_merge_worker_limits",
+                    FunctionSignature()
+                        .AddPositionalOnly("memory_limit", LogicalType::VARCHAR)
+                        .AddPositionalOnly("threads", LogicalType::BIGINT)
+                        .AddPositionalOnly("batch_bytes", LogicalType::LIST(LogicalType::BIGINT)),
+                    DuckLakeSortedMergeWorkerLimitsExecute, DuckLakeSortedMergeWorkerLimitsBind,
+                    DuckLakeRunOnceState::Init) {
 }
 
 DuckLakeSortedMergeFunction::DuckLakeSortedMergeFunction()

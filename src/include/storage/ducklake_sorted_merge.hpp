@@ -54,6 +54,32 @@ private:
 	unique_ptr<LocalTableFunctionState> local_state;
 };
 
+//! Chooses how many workers of a sorted merge may emit batches at once, from the decoded size of the batches. The batch
+//! copy takes a quarter of the memory limit and each worker keeps about two batches in it: one it builds and one
+//! waiting to be written in order.
+class DuckLakeSortedMergeWorkerPolicy {
+public:
+	explicit DuckLakeSortedMergeWorkerPolicy(idx_t max_threads);
+
+	//! Record the decoded bytes of a full batch
+	void AddBatch(idx_t batch_bytes, idx_t max_memory);
+	//! The workers allowed under the current memory limit
+	idx_t WorkerLimit(idx_t max_memory) const;
+	idx_t AverageBatchBytes() const {
+		return average_batch_bytes;
+	}
+
+private:
+	idx_t TargetWorkers(idx_t max_memory) const;
+
+private:
+	idx_t max_threads;
+	//! Follows wider batches at once and narrower batches slowly
+	idx_t average_batch_bytes = 0;
+	//! Drops at once and at most doubles per batch
+	idx_t limit = 1;
+};
+
 //! A run of rows from one merge input: the live rows among file rows [row_start, row_end)
 struct DuckLakeMergeSlice {
 	idx_t input_idx;
