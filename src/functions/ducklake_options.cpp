@@ -40,6 +40,8 @@ static constexpr DuckLakeOptionMetadata DUCKLAKE_OPTIONS[] = {
     {"write_deletion_vectors", "[EXPERIMENTAL - do not use outside testing] Whether to write Iceberg V3 deletion "
                                "vectors (puffin) instead of positional delete files (parquet)"},
     {"sort_on_insert", "Whether to sort data on INSERT according to SET SORTED BY (default: true)"},
+    {"sorted_merge_compaction", "Whether merge_adjacent_files merges files that are already sorted on the table's "
+                                "sort instead of sorting them again (default: true)"},
     {"skip_stats_columns", "Columns for which min/max bounds are not recorded (counts are still recorded)"},
 };
 

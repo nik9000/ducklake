@@ -1,0 +1,187 @@
+# name: test/sql/sorted_table/merge_adjacent_sorted_merge.test
+# description: merge_adjacent_files merges files that are already sorted on the table's sort instead of sorting them
+# group: [sorted_table]
+
+require ducklake
+
+require parquet
+
+test-env DUCKLAKE_CONNECTION {TEST_DIR}/{UUID}.db
+
+test-env DATA_PATH {TEST_DIR}
+
+statement ok
+ATTACH 'ducklake:{DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '{DATA_PATH}/merge_adjacent_sorted_merge', METADATA_CATALOG 'dl', DATA_INLINING_ROW_LIMIT 0)
+
+statement ok
+SET threads = 4
+
+statement ok
+CALL enable_logging(level = 'debug')
+
+# compactions that went through the sorted merge
+statement ok
+CREATE MACRO sorted_merges() AS (SELECT count(*) FROM duckdb_logs WHERE message LIKE 'DuckLake sorted merge:%')
+
+statement ok
+CREATE MACRO file_sorts(tbl) AS TABLE
+SELECT CASE WHEN d.sort_id IS NULL THEN 'none' WHEN d.sort_id = s.sort_id THEN 'current' ELSE 'other' END AS sort
+FROM dl.ducklake_data_file d
+JOIN dl.ducklake_table t ON t.table_id = d.table_id AND t.end_snapshot IS NULL
+LEFT JOIN dl.ducklake_sort_info s ON s.table_id = d.table_id AND s.end_snapshot IS NULL
+WHERE t.table_name = tbl AND d.end_snapshot IS NULL
+ORDER BY d.data_file_id
+
+statement ok
+CREATE TABLE ducklake.t (k INTEGER, s VARCHAR, payload VARCHAR)
+
+statement ok
+ALTER TABLE ducklake.t SET SORTED BY (k, s DESC)
+
+loop i 0 4
+
+statement ok
+INSERT INTO ducklake.t SELECT (r * 7 + {i}) % 1000, 's' || (r % 13), 'p' || {i} || '_' || r FROM range(2500) t(r)
+
+endloop
+
+query I
+SELECT count(*) FROM ducklake_list_files('ducklake', 't')
+----
+4
+
+statement ok
+CREATE TEMP TABLE before_merge AS SELECT k, s, payload FROM ducklake.t
+
+statement ok
+CALL ducklake_merge_adjacent_files('ducklake', 't')
+
+query I
+SELECT sorted_merges() > 0
+----
+true
+
+query I
+SELECT count(*) FROM ducklake_list_files('ducklake', 't')
+----
+1
+
+query I
+FROM file_sorts('t')
+----
+current
+
+# no row of a file comes before the previous one on the sort key
+query I
+SELECT count(*) FROM (
+	SELECT k, s, lag(k) OVER (PARTITION BY filename ORDER BY file_row_number) AS prev_k,
+	       lag(s) OVER (PARTITION BY filename ORDER BY file_row_number) AS prev_s
+	FROM ducklake.t
+) WHERE prev_k > k OR (prev_k = k AND prev_s < s)
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT * FROM before_merge EXCEPT ALL SELECT k, s, payload FROM ducklake.t)
+----
+0
+
+query I
+SELECT count(*) FROM ducklake.t
+----
+10000
+
+# each row keeps the snapshot it was inserted in
+query IIII
+SELECT (SELECT count(*) FROM ducklake.t AT (VERSION => 3)), (SELECT count(*) FROM ducklake.t AT (VERSION => 4)),
+       (SELECT count(*) FROM ducklake.t AT (VERSION => 5)), (SELECT count(*) FROM ducklake.t AT (VERSION => 6))
+----
+2500	5000	7500	10000
+
+# a file without the table's sort keeps the group on the sort
+statement ok
+CALL truncate_duckdb_logs()
+
+statement ok
+CREATE TABLE ducklake.mixed (k INTEGER, s VARCHAR)
+
+statement ok
+ALTER TABLE ducklake.mixed SET SORTED BY (k, s DESC)
+
+statement ok
+INSERT INTO ducklake.mixed SELECT r % 100, 'a' || r FROM range(1000) t(r)
+
+statement ok
+CALL ducklake.set_option('sort_on_insert', false, table_name => 'mixed')
+
+statement ok
+INSERT INTO ducklake.mixed SELECT r % 100, 'b' || r FROM range(1000) t(r)
+
+query I
+FROM file_sorts('mixed')
+----
+current
+none
+
+statement ok
+CALL ducklake_merge_adjacent_files('ducklake', 'mixed')
+
+query I
+SELECT sorted_merges()
+----
+0
+
+query I
+FROM file_sorts('mixed')
+----
+current
+
+# no row of a file comes before the previous one on the sort key
+query I
+SELECT count(*) FROM (
+	SELECT k, s, lag(k) OVER (PARTITION BY filename ORDER BY file_row_number) AS prev_k,
+	       lag(s) OVER (PARTITION BY filename ORDER BY file_row_number) AS prev_s
+	FROM ducklake.mixed
+) WHERE prev_k > k OR (prev_k = k AND prev_s < s)
+----
+0
+
+# the merge can be turned off
+statement ok
+CREATE TABLE ducklake.off (k INTEGER, s VARCHAR)
+
+statement ok
+ALTER TABLE ducklake.off SET SORTED BY (k, s DESC)
+
+loop i 0 3
+
+statement ok
+INSERT INTO ducklake.off SELECT (r * 3 + {i}) % 500, 'v' || r FROM range(1000) t(r)
+
+endloop
+
+statement ok
+CALL ducklake.set_option('sorted_merge_compaction', false, table_name => 'off')
+
+statement ok
+CALL ducklake_merge_adjacent_files('ducklake', 'off')
+
+query I
+SELECT sorted_merges()
+----
+0
+
+query I
+FROM file_sorts('off')
+----
+current
+
+# no row of a file comes before the previous one on the sort key
+query I
+SELECT count(*) FROM (
+	SELECT k, s, lag(k) OVER (PARTITION BY filename ORDER BY file_row_number) AS prev_k,
+	       lag(s) OVER (PARTITION BY filename ORDER BY file_row_number) AS prev_s
+	FROM ducklake.off
+) WHERE prev_k > k OR (prev_k = k AND prev_s < s)
+----
+0

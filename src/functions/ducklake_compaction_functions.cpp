@@ -5,6 +5,7 @@
 #include "storage/ducklake_transaction.hpp"
 #include "storage/ducklake_catalog.hpp"
 #include "storage/ducklake_schema_entry.hpp"
+#include "storage/ducklake_sorted_merge.hpp"
 #include "storage/ducklake_table_entry.hpp"
 #include "storage/ducklake_insert.hpp"
 #include "storage/ducklake_partition_data.hpp"
@@ -471,6 +472,27 @@ unique_ptr<LogicalOperator> DuckLakeCompactor::PlanRewriteScan(
 	return root;
 }
 
+bool DuckLakeCompactor::CanMergeSorted(DuckLakeTableEntry &table, const vector<DuckLakeCompactionFileEntry> &files,
+                                       optional_idx sort_id, bool write_row_id) {
+	if (type != CompactionType::MERGE_ADJACENT_TABLES || write_row_id || !sort_id.IsValid()) {
+		return false;
+	}
+	auto table_sort = table.GetSortData();
+	if (!table_sort || table_sort->WrittenSortId() != sort_id || !DuckLakeSortedMergePlanner::HasMergeableSort(table)) {
+		return false;
+	}
+	auto schema_id = table.ParentSchema().Cast<DuckLakeSchemaEntry>().GetSchemaId();
+	if (catalog.GetConfigOption<string>("sorted_merge_compaction", schema_id, table_id, "true") != "true") {
+		return false;
+	}
+	for (auto &file : files) {
+		if (file.file.sort_id != sort_id) {
+			return false;
+		}
+	}
+	return true;
+}
+
 unique_ptr<LogicalOperator>
 DuckLakeCompactor::GenerateCompactionCommand(vector<DuckLakeCompactionFileEntry> source_files,
                                              bool bind_to_latest_schema) {
@@ -582,6 +604,8 @@ DuckLakeCompactor::GenerateCompactionCommand(vector<DuckLakeCompactionFileEntry>
 		throw InternalException("Invalid Compaction Type");
 	}
 
+	// the scan below takes the file list, the sorted merge needs its own copy
+	auto merge_files = files_to_scan;
 	DuckLakeCopyInput copy_input(context, table, data_path);
 	// merge_adjacent_files does not use partitioning information - instead we always merge within partitions
 	copy_input.partition_data = nullptr;
@@ -597,8 +621,17 @@ DuckLakeCompactor::GenerateCompactionCommand(vector<DuckLakeCompactionFileEntry>
 	auto sort_data = latest_table.GetSortData();
 	optional_idx sort_id;
 	if (sort_data) {
-		root = DuckLakeCompactor::InsertSort(binder, root, latest_table, sort_data);
 		sort_id = sort_data->WrittenSortId();
+		if (CanMergeSorted(table, actionable_source_files, sort_id, write_row_id)) {
+			// every file is sorted on the table's sort already: merge them instead of sorting them
+			auto &scan_slot = root->type == LogicalOperatorType::LOGICAL_PROJECTION ? root->children[0] : root;
+			auto table_index = scan_slot->Cast<LogicalGet>().table_index;
+			scan_slot = PlanDuckLakeSortedMerge(table, std::move(merge_files), table_index, DEFAULT_ROW_GROUP_SIZE,
+			                                    write_snapshot_id);
+			root->ResolveOperatorTypes();
+		} else {
+			root = DuckLakeCompactor::InsertSort(binder, root, latest_table, sort_data);
+		}
 	}
 
 	copy->table_index = binder.GenerateTableIndex();

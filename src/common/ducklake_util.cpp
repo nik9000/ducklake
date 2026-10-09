@@ -666,6 +666,7 @@ static const unordered_map<string, config_option_parser_t> &ConfigOptionParsers(
 	    {"per_thread_output", ParseBoolean},
 	    {"write_deletion_vectors", ParseBoolean},
 	    {"sort_on_insert", ParseBoolean},
+	    {"sorted_merge_compaction", ParseBoolean},
 	    {"skip_stats_columns", ParseSkippedStatsColumns},
 	};
 	return parsers;

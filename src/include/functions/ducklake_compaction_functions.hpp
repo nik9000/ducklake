@@ -110,6 +110,10 @@ public:
 	                unique_ptr<LogicalCopyToFile> &copy);
 
 private:
+	//! Whether the files are all sorted on the table's sort, so compacting them can merge instead of sort
+	bool CanMergeSorted(DuckLakeTableEntry &table, const vector<DuckLakeCompactionFileEntry> &files,
+	                    optional_idx sort_id, bool write_row_id);
+
 	optional_ptr<DuckLakeTableEntry> ResolvePartitionSpecTable(DuckLakeTableEntry &table,
 	                                                           const DuckLakeCompactionFileEntry &source_file,
 	                                                           idx_t partition_id);

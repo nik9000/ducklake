@@ -15,6 +15,7 @@
 #include "duckdb/function/create_sort_key.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/parallel/thread_context.hpp"
+#include "duckdb/planner/logical_operator.hpp"
 #include "duckdb/planner/table_filter_set.hpp"
 #include "storage/ducklake_metadata_info.hpp"
 
@@ -175,5 +176,12 @@ private:
 	vector<idx_t> heap;
 	bool initialized = false;
 };
+
+//! A logical operator emitting the rows of files that are each sorted on the table's sort key, in merged order: the
+//! table's physical columns, then each row's snapshot id when write_snapshot_id is set. Its column bindings use
+//! table_index.
+unique_ptr<LogicalOperator> PlanDuckLakeSortedMerge(DuckLakeTableEntry &table, vector<DuckLakeFileListEntry> files,
+                                                    TableIndex table_index, idx_t row_group_size,
+                                                    bool write_snapshot_id);
 
 } // namespace duckdb

@@ -11,6 +11,7 @@
 #include "duckdb/storage/buffer_manager.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
 #include "storage/ducklake_catalog.hpp"
+#include "storage/ducklake_multi_file_reader.hpp"
 #include "storage/ducklake_sorted_merge.hpp"
 #include "storage/ducklake_table_entry.hpp"
 #include "storage/ducklake_transaction.hpp"
@@ -160,6 +161,8 @@ struct SortedMergeBindData {
 	idx_t row_group_size;
 	//! Decoded bytes per decode unit, derived from the memory limit when not set
 	optional_idx decode_unit_size;
+	//! Whether each row's snapshot id follows the table's columns, as compaction writes it
+	bool write_snapshot_id = false;
 };
 
 //! The live rows of input rows [row_start, row_end), decoded once and shared by every batch that reads them
@@ -339,6 +342,13 @@ static unique_ptr<SortedMergeLocalState> InitSortedMergeLocal(const SortedMergeB
 			result->payload_output_columns.push_back(column_idx);
 		}
 		column_idx++;
+	}
+	if (bind_data.write_snapshot_id) {
+		auto snapshot_id_column = DuckLakeMultiFileReader::COLUMN_IDENTIFIER_SNAPSHOT_ID;
+		result->payload_columns.push_back(result->payload_types.size());
+		result->payload_types.push_back(bind_data.table.GetVirtualColumns().at(snapshot_id_column).type);
+		result->payload_scan_columns.push_back(snapshot_id_column);
+		result->payload_output_columns.push_back(column_idx);
 	}
 	if (!key_types.empty()) {
 		result->key_modifiers = gstate.planner->Modifiers();
@@ -919,6 +929,24 @@ static unique_ptr<LogicalOperator> DuckLakeSortedMergeBind(ClientContext &contex
 		bind_data->decode_unit_size = NumericCast<idx_t>(MaxValue<int64_t>(decode_unit_size.GetValue<int64_t>(), 1));
 	}
 	return make_uniq<DuckLakeLogicalSortedMerge>(bind_index, std::move(bind_data), std::move(return_types));
+}
+
+unique_ptr<LogicalOperator> PlanDuckLakeSortedMerge(DuckLakeTableEntry &table, vector<DuckLakeFileListEntry> files,
+                                                    TableIndex table_index, idx_t row_group_size,
+                                                    bool write_snapshot_id) {
+	vector<LogicalType> return_types;
+	for (auto &column : table.GetColumns().Physical()) {
+		return_types.push_back(column.Type());
+	}
+	if (write_snapshot_id) {
+		return_types.push_back(
+		    table.GetVirtualColumns().at(DuckLakeMultiFileReader::COLUMN_IDENTIFIER_SNAPSHOT_ID).type);
+	}
+	auto bind_data = make_shared_ptr<SortedMergeBindData>(table);
+	bind_data->files = std::move(files);
+	bind_data->row_group_size = row_group_size;
+	bind_data->write_snapshot_id = write_snapshot_id;
+	return make_uniq<DuckLakeLogicalSortedMerge>(table_index, std::move(bind_data), std::move(return_types));
 }
 
 //===--------------------------------------------------------------------===//
