@@ -249,17 +249,18 @@ FROM ducklake_sorted_merge('ducklake', 'late_sort')
 ----
 is not sorted on the sort key
 
-# a file the catalog records as sorted on the current sort is trusted without verification
+# a file the catalog records as sorted on the current sort is trusted without verification in release builds, and
+# verified in debug builds
 statement ok
 UPDATE __ducklake_metadata_ducklake.ducklake_data_file
 SET sort_id = (SELECT sort_id FROM __ducklake_metadata_ducklake.ducklake_sort_info
                WHERE table_id = ducklake_data_file.table_id AND end_snapshot IS NULL)
 WHERE table_id = (SELECT table_id FROM __ducklake_metadata_ducklake.ducklake_table WHERE table_name = 'late_sort')
 
-query I
+statement maybe
 SELECT count(*) FROM ducklake_sorted_merge('ducklake', 'late_sort')
 ----
-1000
+is recorded as sorted on the sort key of table "late_sort" but is not
 
 # a file sorted on an older sort is verified against the current one
 statement ok

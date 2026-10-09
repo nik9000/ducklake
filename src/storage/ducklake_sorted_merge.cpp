@@ -2,6 +2,9 @@
 
 #include "duckdb/common/bswap.hpp"
 #include "duckdb/common/multi_file/multi_file_reader.hpp"
+#include "duckdb/common/multi_file/multi_file_states.hpp"
+#include "duckdb/main/settings.hpp"
+#include "duckdb/parallel/scan_read_ahead.hpp"
 #include "duckdb/common/operator/comparison_operators.hpp"
 #include "duckdb/execution/column_binding_resolver.hpp"
 #include "duckdb/planner/binder.hpp"
@@ -27,6 +30,9 @@ DuckLakeFileScanBind::DuckLakeFileScanBind(ClientContext &context, DuckLakeTable
 	bind_data->Cast<MultiFileBindData>().file_list = make_uniq<DuckLakeMultiFileList>(read_info, std::move(files));
 }
 
+//! Row groups each single-file scan reads ahead
+static constexpr idx_t SCANNER_READ_AHEAD_DEPTH = 2;
+
 DuckLakeSingleFileScanner::DuckLakeSingleFileScanner(ClientContext &context, DuckLakeTableEntry &table,
                                                      const DuckLakeFileScanBind &scan_bind, vector<column_t> column_ids,
                                                      unique_ptr<TableFilterSet> filters_p)
@@ -44,6 +50,12 @@ DuckLakeSingleFileScanner::DuckLakeSingleFileScanner(ClientContext &context, Duc
 	execution_context = make_uniq<ExecutionContext>(context, *thread_context, nullptr);
 	TableFunctionInitInput input(bind_data.get(), std::move(column_ids), vector<idx_t>(), filters.get());
 	global_state = function.init_global(context, input);
+	// DuckDB's automatic read-ahead reserves memory for every thread of each scan, and a merge runs many
+	// single-threaded scans at once, so read ahead a fixed depth instead
+	auto &read_ahead = global_state->Cast<MultiFileGlobalState>().read_ahead;
+	if (read_ahead && Settings::Get<ReadAheadDepthSetting>(context) < 0) {
+		read_ahead = make_uniq<ScanReadAhead>(context, SCANNER_READ_AHEAD_DEPTH, nullptr);
+	}
 	local_state = function.init_local(*execution_context, input, global_state.get());
 }
 
