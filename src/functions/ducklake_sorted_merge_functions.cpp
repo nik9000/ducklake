@@ -81,8 +81,8 @@ static vector<unique_ptr<DuckLakeFileScanBind>> BindMergeInputs(ClientContext &c
 // ducklake_sorted_merge_sequence
 //===--------------------------------------------------------------------===//
 static unique_ptr<FunctionData> DuckLakeSortedMergeSequenceBind(ClientContext &context, TableFunctionBindInput &input,
-                                                            vector<LogicalType> &return_types,
-                                                            vector<Identifier> &names) {
+                                                                vector<LogicalType> &return_types,
+                                                                vector<Identifier> &names) {
 	vector<DuckLakeFileListEntry> files;
 	idx_t row_group_size;
 	auto &table = BindSortedMergeTable(context, input, files, row_group_size);
@@ -300,7 +300,7 @@ static unique_ptr<SortedMergeGlobalState> InitSortedMergeGlobal(ClientContext &c
 	// every input keeps about one unit decoded, so size units to keep that a small part of the memory limit
 	auto max_memory = BufferManager::GetBufferManager(context).GetMaxMemory();
 	result->sequencer = make_uniq<DuckLakeSortedMergeSequencer>(context, bind_data.table, result->inputs,
-	                                                        bind_data.row_group_size * ROW_GROUPS_PER_KEY_SEGMENT);
+	                                                            bind_data.row_group_size * ROW_GROUPS_PER_KEY_SEGMENT);
 	// load key segments ahead only when the memory limit leaves room for two per input, which takes more memory when
 	// the merge also decodes other columns
 	auto input_count = result->inputs.size();

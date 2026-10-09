@@ -228,8 +228,8 @@ static constexpr idx_t CHUNKS_AHEAD = 4;
 static constexpr idx_t MAX_INPUT_SEGMENTS_AHEAD = 2;
 
 DuckLakeSortedMergeSequencer::DuckLakeSortedMergeSequencer(ClientContext &context, DuckLakeTableEntry &table,
-                                                       const vector<unique_ptr<DuckLakeFileScanBind>> &inputs,
-                                                       idx_t segment_size)
+                                                           const vector<unique_ptr<DuckLakeFileScanBind>> &inputs,
+                                                           idx_t segment_size)
     : context(context), table(table), inputs(inputs), segment_size(MaxValue<idx_t>(segment_size, 1)) {
 	auto sort_data = table.GetSortData();
 	if (!sort_data) {
@@ -419,7 +419,7 @@ bool DuckLakeSortedMergeSequencer::LoadChunk(MergeInput &input) {
 		auto &path = inputs[input.input_idx]->file.file.path;
 		if (known_sorted) {
 			throw InvalidInputException("File \"%s\" is recorded as sorted on the sort key of table %s but is not",
-			                        path, table.name);
+			                            path, table.name);
 		}
 		throw InvalidInputException("Cannot merge file \"%s\": it is not sorted on the sort key of table %s", path,
 		                            table.name);
@@ -488,7 +488,7 @@ bool DuckLakeSortedMergeSequencer::Prefetch() {
 }
 
 idx_t DuckLakeSortedMergeSequencer::RunEnd(const MergeInput &input, idx_t start, idx_t end,
-                                         optional_ptr<MergeInput> next) const {
+                                           optional_ptr<MergeInput> next) const {
 	if (!next) {
 		return end;
 	}
@@ -563,7 +563,7 @@ optional_idx DuckLakeSortedMergeSequencer::NextRow(idx_t input_idx) const {
 }
 
 bool DuckLakeSortedMergeSequencer::NextBatch(idx_t max_rows, vector<DuckLakeMergeSlice> &slices,
-                                           optional_ptr<DuckLakeMergeKeys> keys) {
+                                             optional_ptr<DuckLakeMergeKeys> keys) {
 	if (!initialized) {
 		Initialize();
 	}

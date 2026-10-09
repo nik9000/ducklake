@@ -478,7 +478,8 @@ bool DuckLakeCompactor::CanMergeSorted(DuckLakeTableEntry &table, const vector<D
 		return false;
 	}
 	auto table_sort = table.GetSortData();
-	if (!table_sort || table_sort->WrittenSortId() != sort_id || !DuckLakeSortedMergeSequencer::HasMergeableSort(table)) {
+	if (!table_sort || table_sort->WrittenSortId() != sort_id ||
+	    !DuckLakeSortedMergeSequencer::HasMergeableSort(table)) {
 		return false;
 	}
 	auto schema_id = table.ParentSchema().Cast<DuckLakeSchemaEntry>().GetSchemaId();

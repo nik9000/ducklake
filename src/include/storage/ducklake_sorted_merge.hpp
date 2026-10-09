@@ -106,13 +106,13 @@ class DuckLakeSortedMergeSequencer {
 public:
 	//! Inputs are read in segments of segment_size rows
 	DuckLakeSortedMergeSequencer(ClientContext &context, DuckLakeTableEntry &table,
-	                           const vector<unique_ptr<DuckLakeFileScanBind>> &inputs, idx_t segment_size);
+	                             const vector<unique_ptr<DuckLakeFileScanBind>> &inputs, idx_t segment_size);
 	~DuckLakeSortedMergeSequencer();
 
 	//! Whether the table has a sort key that can be merged on
 	static bool HasMergeableSort(DuckLakeTableEntry &table);
-	//! Sequence the next (up to) max_rows rows in merged order, returns false once every row has been sequenced. When keys
-	//! is given, it receives the sort keys of the sequenced rows in merged order.
+	//! Sequence the next (up to) max_rows rows in merged order, returns false once every row has been sequenced. When
+	//! keys is given, it receives the sort keys of the sequenced rows in merged order.
 	bool NextBatch(idx_t max_rows, vector<DuckLakeMergeSlice> &slices, optional_ptr<DuckLakeMergeKeys> keys = nullptr);
 	//! The table columns of the sort key in order, when every sort expression is a distinct column, so their values can
 	//! be decoded from the sort keys. Empty otherwise.
