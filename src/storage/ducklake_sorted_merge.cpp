@@ -176,6 +176,13 @@ private:
 };
 
 //! The sort keys of a chunk of an input, in file order
+//! The current key of an input in the loser tree, kept in one array so comparisons do not chase pointers
+struct DuckLakeSortedMergeSequencer::CurrentKey {
+	uint64_t high = 0;
+	uint64_t low = 0;
+	bool exhausted = true;
+};
+
 //! The sort keys of a chunk of an input, in file order, or only its row numbers when its keys are not needed
 struct DuckLakeSortedMergeSequencer::KeyChunk {
 	shared_ptr<Vector> sort_keys;
@@ -235,6 +242,8 @@ struct DuckLakeSortedMergeSequencer::MergeInput {
 	bool keyless = false;
 	//! Whether the first chunk is loaded, which waits for the input's section when the catalog bounds its keys
 	bool loaded = false;
+	//! The input's leaf in the loser tree of its section
+	idx_t leaf = 0;
 
 	const MergeKey &CurrentKey() const {
 		return keys[position];
@@ -319,6 +328,7 @@ DuckLakeSortedMergeSequencer::DuckLakeSortedMergeSequencer(ClientContext &contex
 		}
 		merge_inputs.push_back(std::move(input));
 	}
+	current_keys.resize(merge_inputs.size());
 }
 
 DuckLakeSortedMergeSequencer::~DuckLakeSortedMergeSequencer() {
@@ -482,8 +492,9 @@ void DuckLakeSortedMergeSequencer::MakeKeyless(MergeInput &input) {
 }
 
 bool DuckLakeSortedMergeSequencer::StartNextSection() {
-	while (heap.empty() && next_section < sections.size()) {
+	while (!SectionActive() && next_section < sections.size()) {
 		active_section = next_section;
+		vector<idx_t> section_inputs;
 		for (auto input_idx : sections[next_section]) {
 			auto &input = *merge_inputs[input_idx];
 			if (!input.loaded) {
@@ -491,12 +502,96 @@ bool DuckLakeSortedMergeSequencer::StartNextSection() {
 				LoadChunk(input);
 			}
 			if (!input.exhausted) {
-				PushInput(input_idx);
+				RefreshKey(input);
+				section_inputs.push_back(input_idx);
 			}
 		}
+		BuildTree(section_inputs);
 		next_section++;
 	}
-	return !heap.empty();
+	return SectionActive();
+}
+
+bool DuckLakeSortedMergeSequencer::SectionActive() const {
+	return !tree.empty() && tree[0] != DConstants::INVALID_INDEX && !merge_inputs[tree[0]]->exhausted;
+}
+
+bool DuckLakeSortedMergeSequencer::Wins(idx_t lhs, idx_t rhs) const {
+	if (lhs == DConstants::INVALID_INDEX || current_keys[lhs].exhausted) {
+		return false;
+	}
+	if (rhs == DConstants::INVALID_INDEX || current_keys[rhs].exhausted) {
+		return true;
+	}
+	auto &lhs_key = current_keys[lhs];
+	auto &rhs_key = current_keys[rhs];
+	if (lhs_key.high != rhs_key.high) {
+		return lhs_key.high < rhs_key.high;
+	}
+	if (lhs_key.low != rhs_key.low) {
+		return lhs_key.low < rhs_key.low;
+	}
+	return InputBefore(*merge_inputs[lhs], *merge_inputs[rhs]);
+}
+
+void DuckLakeSortedMergeSequencer::RefreshKey(const MergeInput &input) {
+	auto &current = current_keys[input.input_idx];
+	current.exhausted = input.exhausted || input.position >= input.keys.size();
+	if (!current.exhausted) {
+		auto &key = input.keys[input.position];
+		current.high = key.high;
+		current.low = key.low;
+	}
+}
+
+void DuckLakeSortedMergeSequencer::BuildTree(const vector<idx_t> &section_inputs) {
+	tree.clear();
+	if (section_inputs.empty()) {
+		return;
+	}
+	idx_t leaves = 1;
+	while (leaves < section_inputs.size()) {
+		leaves *= 2;
+	}
+	// winners of the subtrees, the leaves at [leaves, 2 * leaves)
+	vector<idx_t> winners(2 * leaves, DConstants::INVALID_INDEX);
+	for (idx_t i = 0; i < section_inputs.size(); i++) {
+		winners[leaves + i] = section_inputs[i];
+		merge_inputs[section_inputs[i]]->leaf = leaves + i;
+	}
+	tree.assign(leaves, DConstants::INVALID_INDEX);
+	for (idx_t node = leaves - 1; node >= 1; node--) {
+		auto lhs = winners[2 * node];
+		auto rhs = winners[2 * node + 1];
+		winners[node] = Wins(rhs, lhs) ? rhs : lhs;
+		tree[node] = Wins(rhs, lhs) ? lhs : rhs;
+	}
+	tree[0] = winners[1];
+}
+
+void DuckLakeSortedMergeSequencer::Replay(const MergeInput &input) {
+	auto winner = input.input_idx;
+	for (auto node = input.leaf / 2; node >= 1; node /= 2) {
+		if (Wins(tree[node], winner)) {
+			std::swap(tree[node], winner);
+		}
+	}
+	tree[0] = winner;
+}
+
+optional_ptr<DuckLakeSortedMergeSequencer::MergeInput>
+DuckLakeSortedMergeSequencer::RunnerUp(const MergeInput &winner) const {
+	// every other input lost to one of the inputs on the winner's path
+	auto runner_up = DConstants::INVALID_INDEX;
+	for (auto node = winner.leaf / 2; node >= 1; node /= 2) {
+		if (Wins(tree[node], runner_up)) {
+			runner_up = tree[node];
+		}
+	}
+	if (runner_up == DConstants::INVALID_INDEX || merge_inputs[runner_up]->exhausted) {
+		return nullptr;
+	}
+	return merge_inputs[runner_up].get();
 }
 
 bool DuckLakeSortedMergeSequencer::InputIsNear(idx_t input_idx) const {
@@ -592,6 +687,7 @@ bool DuckLakeSortedMergeSequencer::LoadChunk(MergeInput &input) {
 			chunk = std::move(segment->chunks.front());
 			segment->chunks.pop_front();
 			segment->loaded_chunks--;
+			keys_taken.notify_one();
 		} else {
 			// every row of the segment is merged, or deleted
 			lock_guard<mutex> guard(input.segments_lock);
@@ -684,6 +780,11 @@ bool DuckLakeSortedMergeSequencer::StartSegment() {
 	return true;
 }
 
+void DuckLakeSortedMergeSequencer::WaitForKeysTaken() {
+	unique_lock<mutex> guard(keys_taken_lock);
+	keys_taken.wait_for(guard, std::chrono::milliseconds(1));
+}
+
 bool DuckLakeSortedMergeSequencer::Prefetch() {
 	auto input_count = merge_inputs.size();
 	auto start = prefetch_cursor++;
@@ -739,29 +840,6 @@ bool DuckLakeSortedMergeSequencer::InputBefore(const MergeInput &lhs, const Merg
 	return lhs.input_idx < rhs.input_idx && lhs_key == rhs_key;
 }
 
-void DuckLakeSortedMergeSequencer::PushInput(idx_t input_idx) {
-	heap.push_back(input_idx);
-	std::push_heap(heap.begin(), heap.end(),
-	               [&](idx_t lhs, idx_t rhs) { return InputBefore(*merge_inputs[rhs], *merge_inputs[lhs]); });
-}
-
-void DuckLakeSortedMergeSequencer::SiftDownTop() {
-	idx_t node = 0;
-	while (true) {
-		auto smallest = node;
-		for (auto child = 2 * node + 1; child <= 2 * node + 2 && child < heap.size(); child++) {
-			if (InputBefore(*merge_inputs[heap[child]], *merge_inputs[heap[smallest]])) {
-				smallest = child;
-			}
-		}
-		if (smallest == node) {
-			return;
-		}
-		std::swap(heap[node], heap[smallest]);
-		node = smallest;
-	}
-}
-
 optional_idx DuckLakeSortedMergeSequencer::NextRow(idx_t input_idx) const {
 	auto &input = *merge_inputs[input_idx];
 	if (input.exhausted) {
@@ -780,55 +858,56 @@ bool DuckLakeSortedMergeSequencer::NextBatch(idx_t max_rows, vector<DuckLakeMerg
 	}
 	slices.clear();
 	idx_t sequenced = 0;
-	while (sequenced < max_rows && (!heap.empty() || StartNextSection())) {
-		auto &input = *merge_inputs[heap[0]];
-		// the input to switch to once this one's current row no longer comes first
-		optional_ptr<MergeInput> next_input;
-		if (heap.size() > 1) {
-			auto next_idx = heap[1];
-			if (heap.size() > 2 && InputBefore(*merge_inputs[heap[2]], *merge_inputs[heap[1]])) {
-				next_idx = heap[2];
-			}
-			next_input = merge_inputs[next_idx].get();
-		}
+	while (sequenced < max_rows && (SectionActive() || StartNextSection())) {
+		auto &input = *merge_inputs[tree[0]];
 		DuckLakeMergeSlice slice {input.input_idx, input.row_numbers[input.position], 0, 0};
 		slice.has_keys = !input.keys.empty();
-		// the top input's current row is known to come first
-		auto known_rows = idx_t(1);
+		// the winner's current row comes first. While the inputs interleave, take one row and replay the winner's path;
+		// once the winner wins again, find the run of its rows before the runner-up.
+		bool won_again = false;
+		bool replayed = false;
 		while (true) {
 			auto end = MinValue(input.row_numbers.size(), input.position + max_rows - sequenced);
-			auto run_end = RunEnd(input, MinValue(input.position + known_rows, end), end, next_input);
-			known_rows = 0;
-			if (run_end > input.position) {
-				if (keys && slice.has_keys) {
-					if (key_owners[input.input_idx] != input.sort_keys.get()) {
-						key_owners[input.input_idx] = input.sort_keys.get();
-						keys->owners.push_back(input.sort_keys);
-					}
-					for (idx_t row = input.position; row < run_end; row++) {
-						keys->keys.push_back(input.keys[row].key);
-					}
+			auto run_end = input.position + 1;
+			if (won_again) {
+				run_end = RunEnd(input, MinValue(input.position + 1, end), end, RunnerUp(input));
+			}
+			if (keys && slice.has_keys) {
+				if (key_owners[input.input_idx] != input.sort_keys.get()) {
+					key_owners[input.input_idx] = input.sort_keys.get();
+					keys->owners.push_back(input.sort_keys);
 				}
-				slice.row_end = input.row_numbers[run_end - 1] + 1;
-				slice.row_count += run_end - input.position;
-				sequenced += run_end - input.position;
-				input.position = run_end;
+				for (idx_t row = input.position; row < run_end; row++) {
+					keys->keys.push_back(input.keys[row].key);
+				}
 			}
-			if (input.position < input.row_numbers.size() || !LoadChunk(input) || sequenced == max_rows) {
+			slice.row_end = input.row_numbers[run_end - 1] + 1;
+			slice.row_count += run_end - input.position;
+			sequenced += run_end - input.position;
+			input.position = run_end;
+			replayed = false;
+			if (input.position == input.row_numbers.size() &&
+			    (!LoadChunk(input) || input.keys.empty() == slice.has_keys)) {
+				// the input is exhausted, or a slice has the keys of all its rows or of none
+				RefreshKey(input);
 				break;
 			}
-			if (input.keys.empty() == slice.has_keys) {
-				// a slice has the keys of all its rows or of none
+			RefreshKey(input);
+			if (sequenced == max_rows) {
 				break;
 			}
+			Replay(input);
+			replayed = true;
+			if (tree[0] != input.input_idx) {
+				break;
+			}
+			won_again = true;
 		}
 		D_ASSERT(slice.row_count > 0);
 		slices.push_back(slice);
-		if (input.exhausted) {
-			heap[0] = heap.back();
-			heap.pop_back();
+		if (!replayed) {
+			Replay(input);
 		}
-		SiftDownTop();
 	}
 	return !slices.empty();
 }

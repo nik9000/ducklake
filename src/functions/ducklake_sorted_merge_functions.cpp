@@ -638,8 +638,8 @@ static SortedMergeBatchResult LoadSortedMergeBatch(ClientContext &context, const
 				return SortedMergeBatchResult::PARKED;
 			}
 			if (!gstate.sequencer->Prefetch()) {
-				guard.lock();
-				break;
+				// nothing to load yet, wait until the sequencer takes keys from the ones loaded
+				gstate.sequencer->WaitForKeysTaken();
 			}
 			guard.try_lock();
 		}

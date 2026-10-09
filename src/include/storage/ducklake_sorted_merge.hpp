@@ -9,6 +9,7 @@
 #pragma once
 
 #include "duckdb/common/atomic.hpp"
+#include <condition_variable>
 #include "duckdb/common/multi_file/multi_file_reader.hpp"
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
@@ -133,6 +134,8 @@ public:
 	//! Load sort keys ahead of the merge. Safe to call without holding the lock that guards NextBatch. Returns false
 	//! when there is nothing to load.
 	bool Prefetch();
+	//! Wait until the merge takes loaded keys, so Prefetch has keys to load again, or a short while passes
+	void WaitForKeysTaken();
 	//! Whether the input is merged in the section being merged or the next one, so reading ahead for it pays off soon
 	bool InputIsNear(idx_t input_idx) const;
 	//! The number of sections of inputs whose key ranges overlap, each merged after the one before
@@ -149,6 +152,7 @@ public:
 
 private:
 	struct KeyChunk;
+	struct CurrentKey;
 	struct KeySegment;
 	struct MergeInput;
 
@@ -173,9 +177,18 @@ private:
 	//! The end of the run of rows in [input.position, end) that come before the current row of next, given that
 	//! the rows before start do
 	idx_t RunEnd(const MergeInput &input, idx_t start, idx_t end, optional_ptr<MergeInput> next) const;
-	void PushInput(idx_t input_idx);
-	//! Restore heap order after the top input's current row changed
-	void SiftDownTop();
+	//! Whether an input of the section being merged has rows left
+	bool SectionActive() const;
+	//! Whether the current row of lhs comes before the current row of rhs, an invalid or exhausted input never does
+	bool Wins(idx_t lhs, idx_t rhs) const;
+	//! Build the loser tree of a section's inputs: each node holds the input that lost there, the root the winner
+	void BuildTree(const vector<idx_t> &section_inputs);
+	//! Record the input's current key for the tree, after its current row changed
+	void RefreshKey(const MergeInput &input);
+	//! Restore the tree after the input's current row changed, from its leaf up
+	void Replay(const MergeInput &input);
+	//! The input whose current row comes first after the winner's
+	optional_ptr<MergeInput> RunnerUp(const MergeInput &winner) const;
 
 private:
 	ClientContext &context;
@@ -197,8 +210,11 @@ private:
 	atomic<idx_t> segments_ahead {0};
 	//! Where the next Prefetch starts looking, so inputs are visited in turn
 	atomic<idx_t> prefetch_cursor {0};
-	//! Heap of the inputs that still have rows, ordered by their current row
-	vector<idx_t> heap;
+	mutex keys_taken_lock;
+	std::condition_variable keys_taken;
+	//! The loser tree of the section being merged: tree[0] is the winner, tree[node] the input that lost at node
+	vector<idx_t> tree;
+	vector<CurrentKey> current_keys;
 	atomic<bool> initialized {false};
 	//! Inputs grouped into sections of overlapping key ranges, in key order
 	vector<vector<idx_t>> sections;
