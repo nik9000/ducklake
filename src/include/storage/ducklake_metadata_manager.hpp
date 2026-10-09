@@ -650,6 +650,9 @@ public:
 	map<idx_t, set<idx_t>> ReadInlinedFileDeletions(TableIndex table_id, DuckLakeSnapshot snapshot);
 	//! The record count of each live data file of a table and the sort it was written sorted by, if it records one
 	map<DataFileIndex, DuckLakeDataFileMergeInfo> ReadDataFileMergeInfo(TableIndex table_id, DuckLakeSnapshot snapshot);
+	//! The statistics of the given columns of each live data file of a table, by file and then column field index
+	map<DataFileIndex, map<idx_t, DuckLakeFileKeyStats>>
+	ReadDataFileKeyStats(TableIndex table_id, DuckLakeSnapshot snapshot, const vector<FieldIndex> &fields);
 	//! Clear inlined table caches (needed after rollback so retry re-creates the tables)
 	void ClearInlinedTableCaches();
 

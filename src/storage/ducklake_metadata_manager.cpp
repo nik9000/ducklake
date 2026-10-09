@@ -2169,6 +2169,47 @@ WHERE table_id=%d AND {SNAPSHOT_ID} >= begin_snapshot AND ({SNAPSHOT_ID} < end_s
 	return result;
 }
 
+map<DataFileIndex, map<idx_t, DuckLakeFileKeyStats>>
+DuckLakeMetadataManager::ReadDataFileKeyStats(TableIndex table_id, DuckLakeSnapshot snapshot,
+                                              const vector<FieldIndex> &fields) {
+	map<DataFileIndex, map<idx_t, DuckLakeFileKeyStats>> result;
+	if (fields.empty()) {
+		return result;
+	}
+	vector<string> field_ids;
+	for (auto &field : fields) {
+		field_ids.push_back(to_string(field.index));
+	}
+	auto query = StringUtil::Format(R"(
+SELECT s.data_file_id, s.column_id, s.min_value, s.max_value, s.null_count, s.min_is_exact, s.max_is_exact,
+       s.contains_nan
+FROM {METADATA_CATALOG}.ducklake_file_column_stats s
+JOIN {METADATA_CATALOG}.ducklake_data_file d USING (data_file_id)
+WHERE d.table_id=%d AND s.column_id IN (%s) AND {SNAPSHOT_ID} >= d.begin_snapshot
+      AND ({SNAPSHOT_ID} < d.end_snapshot OR d.end_snapshot IS NULL)
+)",
+	                                table_id.index, StringUtil::Join(field_ids, ", "));
+	auto query_result = Query(snapshot, query);
+	query_result->ThrowIfError("Failed to get data file key statistics from DuckLake: ");
+	for (auto &row : *query_result) {
+		DuckLakeFileKeyStats stats;
+		stats.has_min = !row.IsNull(2);
+		if (stats.has_min) {
+			stats.min = row.GetValue<string>(2);
+		}
+		stats.has_max = !row.IsNull(3);
+		if (stats.has_max) {
+			stats.max = row.GetValue<string>(3);
+		}
+		stats.null_count = row.IsNull(4) ? 0 : row.GetValue<idx_t>(4);
+		stats.min_is_exact = !row.IsNull(5) && row.GetValue<bool>(5);
+		stats.max_is_exact = !row.IsNull(6) && row.GetValue<bool>(6);
+		stats.contains_nan = !row.IsNull(7) && row.GetValue<bool>(7);
+		result[DataFileIndex(row.GetValue<idx_t>(0))].emplace(row.GetValue<idx_t>(1), std::move(stats));
+	}
+	return result;
+}
+
 vector<DuckLakeFileListEntry> DuckLakeMetadataManager::GetTableInsertions(DuckLakeTableEntry &table,
                                                                           DuckLakeSnapshot start_snapshot,
                                                                           DuckLakeSnapshot end_snapshot) {

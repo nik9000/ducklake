@@ -301,6 +301,7 @@ static unique_ptr<SortedMergeGlobalState> InitSortedMergeGlobal(ClientContext &c
 	auto max_memory = BufferManager::GetBufferManager(context).GetMaxMemory();
 	result->sequencer = make_uniq<DuckLakeSortedMergeSequencer>(context, bind_data.table, result->inputs,
 	                                                            bind_data.row_group_size * ROW_GROUPS_PER_KEY_SEGMENT);
+	result->sequencer->Initialize();
 	// load key segments ahead only when the memory limit leaves room for two per input, which takes more memory when
 	// the merge also decodes other columns
 	auto input_count = result->inputs.size();
@@ -492,6 +493,9 @@ static bool DecodeAhead(ClientContext &context, const SortedMergeBindData &bind_
 	auto start = gstate.decode_ahead_cursor++;
 	for (idx_t i = 0; i < input_count; i++) {
 		auto input_idx = (start + i) % input_count;
+		if (!gstate.sequencer->InputIsNear(input_idx)) {
+			continue;
+		}
 		auto &input_reader = *gstate.readers[input_idx];
 		shared_ptr<SortedMergeSegmentReader> reader;
 		idx_t next_row;
@@ -690,6 +694,8 @@ static void FinishSortedMergeBatch(ExecutionContext &context, const PhysicalOper
 			info["Units Decoded Ahead"] =
 			    gstate.decode_ahead ? to_string(gstate.units_decoded_ahead.load()) : "off (too many inputs)";
 			info["Columns From Sort Keys"] = to_string(gstate.sequencer->DecodableColumns().size());
+			info["Sections"] = to_string(gstate.sequencer->SectionCount());
+			info["Sections Merged Without Keys"] = to_string(gstate.sequencer->KeylessSectionCount());
 			info["Decode Unit Bytes"] = to_string(gstate.unit_size_bytes);
 			auto &metrics = context.thread.profiler.GetOperatorMetrics(op);
 			metrics.name = op.GetName();

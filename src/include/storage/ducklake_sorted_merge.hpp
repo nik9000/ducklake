@@ -9,6 +9,7 @@
 #pragma once
 
 #include "duckdb/common/atomic.hpp"
+#include "duckdb/common/multi_file/multi_file_reader.hpp"
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/execution/expression_executor.hpp"
@@ -91,6 +92,8 @@ struct DuckLakeMergeSlice {
 	idx_t row_start;
 	idx_t row_end;
 	idx_t row_count;
+	//! Whether the sequencer read the sort keys of the rows
+	bool has_keys = true;
 };
 
 //! The sort keys of sequenced rows in merged order, sharing the sequencer's key data
@@ -111,13 +114,16 @@ public:
 
 	//! Whether the table has a sort key that can be merged on
 	static bool HasMergeableSort(DuckLakeTableEntry &table);
+	//! Read the first keys of the inputs and group them into sections, before the first batch
+	void Initialize();
 	//! Sequence the next (up to) max_rows rows in merged order, returns false once every row has been sequenced. When
 	//! keys is given, it receives the sort keys of the sequenced rows in merged order.
 	bool NextBatch(idx_t max_rows, vector<DuckLakeMergeSlice> &slices, optional_ptr<DuckLakeMergeKeys> keys = nullptr);
 	//! The table columns of the sort key in order, when every sort expression is a distinct column, so their values can
 	//! be decoded from the sort keys. Empty otherwise.
 	const vector<idx_t> &DecodableColumns() const {
-		return decodable_columns;
+		// rows merged without their keys read the key columns from the files
+		return keyless_sections > 0 ? no_columns : decodable_columns;
 	}
 	const vector<OrderModifiers> &Modifiers() const {
 		return modifiers;
@@ -127,6 +133,15 @@ public:
 	//! Load sort keys ahead of the merge. Safe to call without holding the lock that guards NextBatch. Returns false
 	//! when there is nothing to load.
 	bool Prefetch();
+	//! Whether the input is merged in the section being merged or the next one, so reading ahead for it pays off soon
+	bool InputIsNear(idx_t input_idx) const;
+	//! The number of sections of inputs whose key ranges overlap, each merged after the one before
+	idx_t SectionCount() const {
+		return sections.size();
+	}
+	idx_t KeylessSectionCount() const {
+		return keyless_sections;
+	}
 	//! At most this many segments, across inputs, are loaded at once. Prefetch loads none ahead until it is set.
 	void SetMaxSegmentsAhead(idx_t max_segments) {
 		max_segments_ahead = max_segments;
@@ -137,7 +152,15 @@ private:
 	struct KeySegment;
 	struct MergeInput;
 
-	void Initialize();
+	//! Read the key of the input's last row
+	void ReadLastKey(MergeInput &input);
+	//! Bound the input's keys by the catalog's statistics of the sort key columns, returns false when they do not
+	bool CatalogBounds(const map<idx_t, DuckLakeFileKeyStats> &file_stats, const vector<FieldIndex> &fields,
+	                   MergeInput &input);
+	//! Read only the row numbers of an input merged alone from now on
+	void MakeKeyless(MergeInput &input);
+	//! Start merging the inputs of the next section, returns false when every section is merged
+	bool StartNextSection();
 	bool LoadChunk(MergeInput &input);
 	//! Load the next chunk of keys of a segment, the caller holds the segment's lock
 	void LoadKeys(MergeInput &input, KeySegment &segment);
@@ -164,6 +187,7 @@ private:
 	vector<LogicalType> key_types;
 	vector<OrderModifiers> modifiers;
 	vector<idx_t> decodable_columns;
+	vector<idx_t> no_columns;
 	//! The key data each input's keys in the batch being sequenced share, so it is kept alive once
 	vector<const Vector *> key_owners;
 	vector<unique_ptr<MergeInput>> merge_inputs;
@@ -175,7 +199,15 @@ private:
 	atomic<idx_t> prefetch_cursor {0};
 	//! Heap of the inputs that still have rows, ordered by their current row
 	vector<idx_t> heap;
-	bool initialized = false;
+	atomic<bool> initialized {false};
+	//! Inputs grouped into sections of overlapping key ranges, in key order
+	vector<vector<idx_t>> sections;
+	//! Sections of a single input recorded as sorted, merged without their keys
+	idx_t keyless_sections = 0;
+	//! Columns scanned for an input merged without its keys: file_row_number
+	vector<column_t> row_number_column_ids {MultiFileReader::COLUMN_IDENTIFIER_FILE_ROW_NUMBER};
+	idx_t next_section = 0;
+	atomic<idx_t> active_section {0};
 };
 
 //! A logical operator emitting the rows of files that are each sorted on the table's sort key, in merged order: the

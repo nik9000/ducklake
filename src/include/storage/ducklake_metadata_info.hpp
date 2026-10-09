@@ -471,6 +471,18 @@ struct DuckLakeDataFileMergeInfo {
 	optional_idx sort_id;
 };
 
+//! The min/max statistics of a column of a data file
+struct DuckLakeFileKeyStats {
+	string min;
+	string max;
+	bool has_min = false;
+	bool has_max = false;
+	bool min_is_exact = false;
+	bool max_is_exact = false;
+	bool contains_nan = false;
+	idx_t null_count = 0;
+};
+
 struct DuckLakeCompactionFileData : public DuckLakeCompactionBaseFileData {
 	optional_idx row_id_start;
 	MappingIndex mapping_id;

@@ -531,3 +531,199 @@ SELECT count(*) FROM (SELECT k, lag(k) OVER () AS prev FROM ducklake_sorted_merg
 
 statement ok
 RESET memory_limit
+
+statement ok
+RESET memory_limit
+
+# inputs whose key ranges do not overlap are merged a section at a time, in key order whatever order they were written
+statement ok
+CREATE TABLE ducklake.sections (k INTEGER, file INTEGER)
+
+statement ok
+ALTER TABLE ducklake.sections SET SORTED BY (k)
+
+# three disjoint files, the last written first
+statement ok
+INSERT INTO ducklake.sections SELECT 2000 + r, 0 FROM range(1000) t(r)
+
+statement ok
+INSERT INTO ducklake.sections SELECT r, 1 FROM range(1000) t(r)
+
+statement ok
+INSERT INTO ducklake.sections SELECT 1000 + r, 2 FROM range(1000) t(r)
+
+query I
+SELECT k FROM (SELECT k, row_number() OVER () AS rn FROM ducklake_sorted_merge('ducklake', 'sections', row_group_size := 100))
+WHERE rn IN (1, 1000, 1001, 2000, 2001, 3000) ORDER BY rn
+----
+0
+999
+1000
+1999
+2000
+2999
+
+query II
+EXPLAIN ANALYZE SELECT count(*) FROM ducklake_sorted_merge('ducklake', 'sections')
+----
+analyzed_plan	<REGEX>:.*Sections: 3.*
+
+# files merged alone are merged without reading their keys, so the key columns are read with the other columns
+query II
+EXPLAIN ANALYZE SELECT count(*) FROM ducklake_sorted_merge('ducklake', 'sections')
+----
+analyzed_plan	<REGEX>:.*Sections Merged Without Keys: 3.*
+
+query II
+EXPLAIN ANALYZE SELECT count(*) FROM ducklake_sorted_merge('ducklake', 'sections')
+----
+analyzed_plan	<REGEX>:.*Columns From Sort Keys: 0.*
+
+query III
+SELECT input_index, row_start, row_count FROM ducklake_sorted_merge_sequence('ducklake', 'sections', row_group_size := 1500)
+----
+1	0	1000
+2	0	500
+2	500	500
+0	0	1000
+
+# a file that starts on the key another ends on joins its section, so the tie keeps input order
+statement ok
+INSERT INTO ducklake.sections SELECT 999 - r, 3 FROM range(10) t(r)
+
+query I
+SELECT list(file) FROM (SELECT * FROM ducklake_sorted_merge('ducklake', 'sections')) WHERE k = 999
+----
+[1, 3]
+
+query II
+EXPLAIN ANALYZE SELECT count(*) FROM ducklake_sorted_merge('ducklake', 'sections')
+----
+analyzed_plan	<REGEX>:.*Sections: 3.*
+
+# two bunches of overlapping files
+statement ok
+CREATE TABLE ducklake.bunches (k INTEGER, s VARCHAR)
+
+statement ok
+ALTER TABLE ducklake.bunches SET SORTED BY (k)
+
+loop i 0 3
+
+statement ok
+INSERT INTO ducklake.bunches SELECT r * 3 + {i}, 'low' FROM range(1000) t(r)
+
+statement ok
+INSERT INTO ducklake.bunches SELECT 10000 + r * 3 + {i}, 'high' FROM range(1000) t(r)
+
+endloop
+
+query II
+EXPLAIN ANALYZE SELECT count(*) FROM ducklake_sorted_merge('ducklake', 'bunches')
+----
+analyzed_plan	<REGEX>:.*Sections: 2.*
+
+statement ok
+CREATE TEMP TABLE merged_bunches AS FROM ducklake_sorted_merge('ducklake', 'bunches', row_group_size := 100)
+
+query I
+SELECT count(*) FROM (SELECT rowid, k FROM merged_bunches) m
+FULL OUTER JOIN (SELECT row_number() OVER (ORDER BY k) - 1 AS rowid, k FROM ducklake.bunches) e USING (rowid)
+WHERE m.k IS DISTINCT FROM e.k
+----
+0
+
+# the catalog's statistics still bound a file whose last row is deleted
+statement ok
+DELETE FROM ducklake.sections WHERE k = 999 AND file = 1
+
+query II
+EXPLAIN ANALYZE SELECT count(*) FROM ducklake_sorted_merge('ducklake', 'sections')
+----
+analyzed_plan	<REGEX>:.*Sections: 3.*
+
+statement ok
+CREATE TEMP TABLE merged_sections AS FROM ducklake_sorted_merge('ducklake', 'sections', row_group_size := 100)
+
+query I
+SELECT count(*) FROM (SELECT rowid, k FROM merged_sections) m
+FULL OUTER JOIN (SELECT row_number() OVER (ORDER BY k) - 1 AS rowid, k FROM ducklake.sections) e USING (rowid)
+WHERE m.k IS DISTINCT FROM e.k
+----
+0
+
+# files merged alone are read without keys past their first chunk, across segments and deletes
+statement ok
+CREATE TABLE ducklake.solo (k INTEGER, s VARCHAR)
+
+statement ok
+ALTER TABLE ducklake.solo SET SORTED BY (k)
+
+statement ok
+INSERT INTO ducklake.solo SELECT 20000 + r, 'c' || r FROM range(10000) t(r)
+
+statement ok
+INSERT INTO ducklake.solo SELECT r, 'a' || r FROM range(10000) t(r)
+
+statement ok
+INSERT INTO ducklake.solo SELECT 10000 + r, 'b' || r FROM range(10000) t(r)
+
+statement ok
+DELETE FROM ducklake.solo WHERE k BETWEEN 4000 AND 4999 OR k % 97 = 0
+
+query II
+EXPLAIN ANALYZE SELECT count(*) FROM ducklake_sorted_merge('ducklake', 'solo', row_group_size := 700)
+----
+analyzed_plan	<REGEX>:.*Sections Merged Without Keys: 3.*
+
+statement ok
+CREATE TEMP TABLE merged_solo AS FROM ducklake_sorted_merge('ducklake', 'solo', row_group_size := 700)
+
+query I
+SELECT count(*) FROM (SELECT rowid, k, s FROM merged_solo) m
+FULL OUTER JOIN (SELECT row_number() OVER (ORDER BY k) - 1 AS rowid, k, s FROM ducklake.solo) e USING (rowid)
+WHERE m.k IS DISTINCT FROM e.k OR m.s IS DISTINCT FROM e.s
+----
+0
+
+query II
+SELECT count(*), sum(row_count) = (SELECT count(*) FROM ducklake.solo)
+FROM ducklake_sorted_merge_sequence('ducklake', 'solo', row_group_size := 700, summary := true)
+----
+41	true
+
+# without statistics to bound them, keys are read from the files, and a file whose last row is deleted has no known
+# end, so it merges with every later file
+statement ok
+CREATE TABLE ducklake.expr_sections (k INTEGER)
+
+statement ok
+ALTER TABLE ducklake.expr_sections SET SORTED BY (k + 1)
+
+statement ok
+INSERT INTO ducklake.expr_sections SELECT 2000 + r FROM range(1000) t(r)
+
+statement ok
+INSERT INTO ducklake.expr_sections SELECT r FROM range(1000) t(r)
+
+statement ok
+INSERT INTO ducklake.expr_sections SELECT 1000 + r FROM range(1000) t(r)
+
+query II
+EXPLAIN ANALYZE SELECT count(*) FROM ducklake_sorted_merge('ducklake', 'expr_sections')
+----
+analyzed_plan	<REGEX>:.*Sections: 3.*
+
+statement ok
+DELETE FROM ducklake.expr_sections WHERE k = 999
+
+query II
+EXPLAIN ANALYZE SELECT count(*) FROM ducklake_sorted_merge('ducklake', 'expr_sections')
+----
+analyzed_plan	<REGEX>:.*Sections: 1.*
+
+query I
+SELECT count(*) FROM (SELECT k, lag(k) OVER () AS prev FROM ducklake_sorted_merge('ducklake', 'expr_sections'))
+WHERE prev > k
+----
+0
