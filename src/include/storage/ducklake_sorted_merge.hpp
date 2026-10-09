@@ -140,6 +140,8 @@ public:
 		return wait_generation;
 	}
 	void WaitForWork(idx_t seen_generation);
+	//! Whether the section being merged merges keys of several inputs, so workers can load keys ahead for it
+	bool MergingKeys() const;
 	void NotifyWaiters();
 	//! Whether the input is merged in the section being merged or the next one, so reading ahead for it pays off soon
 	bool InputIsNear(idx_t input_idx) const;

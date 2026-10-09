@@ -780,6 +780,14 @@ bool DuckLakeSortedMergeSequencer::StartSegment() {
 	return true;
 }
 
+bool DuckLakeSortedMergeSequencer::MergingKeys() const {
+	if (!initialized) {
+		return true;
+	}
+	auto section = active_section.load();
+	return section < sections.size() && sections[section].size() > 1;
+}
+
 void DuckLakeSortedMergeSequencer::WaitForWork(idx_t seen_generation) {
 	unique_lock<mutex> guard(waiters_lock);
 	waiters.wait_for(guard, std::chrono::milliseconds(10), [&]() { return wait_generation != seen_generation; });

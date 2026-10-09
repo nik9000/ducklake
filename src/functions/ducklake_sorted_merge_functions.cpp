@@ -639,6 +639,10 @@ static SortedMergeBatchResult LoadSortedMergeBatch(ClientContext &context, const
 			}
 			auto generation = gstate.sequencer->WaitGeneration();
 			if (!gstate.sequencer->Prefetch()) {
+				if (!gstate.sequencer->MergingKeys()) {
+					guard.lock();
+					break;
+				}
 				// nothing to load yet, wait until there is, or the sequencer is free
 				gstate.sequencer->WaitForWork(generation);
 			}
