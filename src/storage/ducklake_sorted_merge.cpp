@@ -175,7 +175,6 @@ private:
 	}
 };
 
-//! The sort keys of a chunk of an input, in file order
 //! The current key of an input in the loser tree, kept in one array so comparisons do not chase pointers
 struct DuckLakeSortedMergeSequencer::CurrentKey {
 	uint64_t high = 0;
@@ -687,7 +686,8 @@ bool DuckLakeSortedMergeSequencer::LoadChunk(MergeInput &input) {
 			chunk = std::move(segment->chunks.front());
 			segment->chunks.pop_front();
 			segment->loaded_chunks--;
-			keys_taken.notify_one();
+			// wake a worker to load more keys
+			NotifyWaiters();
 		} else {
 			// every row of the segment is merged, or deleted
 			lock_guard<mutex> guard(input.segments_lock);
@@ -780,9 +780,17 @@ bool DuckLakeSortedMergeSequencer::StartSegment() {
 	return true;
 }
 
-void DuckLakeSortedMergeSequencer::WaitForKeysTaken() {
-	unique_lock<mutex> guard(keys_taken_lock);
-	keys_taken.wait_for(guard, std::chrono::milliseconds(1));
+void DuckLakeSortedMergeSequencer::WaitForWork(idx_t seen_generation) {
+	unique_lock<mutex> guard(waiters_lock);
+	waiters.wait_for(guard, std::chrono::milliseconds(10), [&]() { return wait_generation != seen_generation; });
+}
+
+void DuckLakeSortedMergeSequencer::NotifyWaiters() {
+	{
+		lock_guard<mutex> guard(waiters_lock);
+		wait_generation++;
+	}
+	waiters.notify_one();
 }
 
 bool DuckLakeSortedMergeSequencer::Prefetch() {

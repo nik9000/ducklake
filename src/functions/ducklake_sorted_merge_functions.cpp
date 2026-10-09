@@ -637,9 +637,10 @@ static SortedMergeBatchResult LoadSortedMergeBatch(ClientContext &context, const
 				input.batch_index_state = SourceBatchIndexState::ADVANCED;
 				return SortedMergeBatchResult::PARKED;
 			}
+			auto generation = gstate.sequencer->WaitGeneration();
 			if (!gstate.sequencer->Prefetch()) {
-				// nothing to load yet, wait until the sequencer takes keys from the ones loaded
-				gstate.sequencer->WaitForKeysTaken();
+				// nothing to load yet, wait until there is, or the sequencer is free
+				gstate.sequencer->WaitForWork(generation);
 			}
 			guard.try_lock();
 		}
@@ -680,7 +681,8 @@ static SortedMergeBatchResult LoadSortedMergeBatch(ClientContext &context, const
 			reader.sequenced_row = next_row.IsValid() ? next_row.GetIndex() : NumericLimits<idx_t>::Maximum();
 		}
 	}
-	// parked workers report a higher batch index
+	// a worker waiting for the sequencer can take it, and parked workers report a higher batch index
+	gstate.sequencer->NotifyWaiters();
 	WakeParkedWorkers(gstate);
 	for (auto input_idx : lstate.batch_inputs) {
 		TakeUnits(context, bind_data, gstate, lstate, input_idx, *lstate.cursors[input_idx]);

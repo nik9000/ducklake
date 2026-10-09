@@ -134,8 +134,13 @@ public:
 	//! Load sort keys ahead of the merge. Safe to call without holding the lock that guards NextBatch. Returns false
 	//! when there is nothing to load.
 	bool Prefetch();
-	//! Wait until the merge takes loaded keys, so Prefetch has keys to load again, or a short while passes
-	void WaitForKeysTaken();
+	//! Workers with nothing to load wait for work: the merge taking loaded keys of an input, or the lock that
+	//! guards NextBatch being released. A worker reads the generation before Prefetch, so no notification is lost.
+	idx_t WaitGeneration() const {
+		return wait_generation;
+	}
+	void WaitForWork(idx_t seen_generation);
+	void NotifyWaiters();
 	//! Whether the input is merged in the section being merged or the next one, so reading ahead for it pays off soon
 	bool InputIsNear(idx_t input_idx) const;
 	//! The number of sections of inputs whose key ranges overlap, each merged after the one before
@@ -210,8 +215,9 @@ private:
 	atomic<idx_t> segments_ahead {0};
 	//! Where the next Prefetch starts looking, so inputs are visited in turn
 	atomic<idx_t> prefetch_cursor {0};
-	mutex keys_taken_lock;
-	std::condition_variable keys_taken;
+	mutex waiters_lock;
+	std::condition_variable waiters;
+	atomic<idx_t> wait_generation {0};
 	//! The loser tree of the section being merged: tree[0] is the winner, tree[node] the input that lost at node
 	vector<idx_t> tree;
 	vector<CurrentKey> current_keys;
