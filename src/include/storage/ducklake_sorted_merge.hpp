@@ -92,24 +92,43 @@ struct DuckLakeMergeSlice {
 	idx_t row_count;
 };
 
+//! The sort keys of planned rows in merged order, sharing the planner's key data
+struct DuckLakeMergeKeys {
+	vector<string_t> keys;
+	//! Keep the key data alive
+	vector<shared_ptr<Vector>> owners;
+};
+
 //! Plans a k-way merge of files that are each sorted on the table's sort key, reading only the key columns
 class DuckLakeSortedMergePlanner {
 public:
-	//! Inputs are read in segments of segment_size rows, and at most max_segments_ahead segments are loaded ahead
+	//! Inputs are read in segments of segment_size rows
 	DuckLakeSortedMergePlanner(ClientContext &context, DuckLakeTableEntry &table,
-	                           const vector<unique_ptr<DuckLakeFileScanBind>> &inputs, idx_t segment_size,
-	                           idx_t max_segments_ahead);
+	                           const vector<unique_ptr<DuckLakeFileScanBind>> &inputs, idx_t segment_size);
 	~DuckLakeSortedMergePlanner();
 
 	//! Whether the table has a sort key that can be merged on
 	static bool HasMergeableSort(DuckLakeTableEntry &table);
-	//! Plan the next (up to) max_rows rows in merged order, returns false once every row has been planned
-	bool NextBatch(idx_t max_rows, vector<DuckLakeMergeSlice> &slices);
+	//! Plan the next (up to) max_rows rows in merged order, returns false once every row has been planned. When keys
+	//! is given, it receives the sort keys of the planned rows in merged order.
+	bool NextBatch(idx_t max_rows, vector<DuckLakeMergeSlice> &slices, optional_ptr<DuckLakeMergeKeys> keys = nullptr);
+	//! The table columns of the sort key in order, when every sort expression is a distinct column, so their values can
+	//! be decoded from the sort keys. Empty otherwise.
+	const vector<idx_t> &DecodableColumns() const {
+		return decodable_columns;
+	}
+	const vector<OrderModifiers> &Modifiers() const {
+		return modifiers;
+	}
 	//! The file row number of the next row of an input to be planned, invalid once every row of it is planned
 	optional_idx NextRow(idx_t input_idx) const;
 	//! Load sort keys ahead of the merge. Safe to call without holding the lock that guards NextBatch. Returns false
 	//! when there is nothing to load.
 	bool Prefetch();
+	//! At most this many segments, across inputs, are loaded at once. Prefetch loads none ahead until it is set.
+	void SetMaxSegmentsAhead(idx_t max_segments) {
+		max_segments_ahead = max_segments;
+	}
 
 private:
 	struct KeyChunk;
@@ -142,9 +161,12 @@ private:
 	vector<unique_ptr<Expression>> key_expressions;
 	vector<LogicalType> key_types;
 	vector<OrderModifiers> modifiers;
+	vector<idx_t> decodable_columns;
+	//! The key data each input's keys in the batch being planned share, so it is kept alive once
+	vector<const Vector *> key_owners;
 	vector<unique_ptr<MergeInput>> merge_inputs;
 	idx_t segment_size;
-	idx_t max_segments_ahead;
+	atomic<idx_t> max_segments_ahead {0};
 	//! Segments created and not yet merged, across inputs
 	atomic<idx_t> segments_ahead {0};
 	//! Where the next Prefetch starts looking, so inputs are visited in turn

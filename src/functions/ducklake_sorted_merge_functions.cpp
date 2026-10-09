@@ -110,8 +110,7 @@ static unique_ptr<FunctionData> DuckLakeSortedMergePlanBind(ClientContext &conte
 	return_types.emplace_back(LogicalType::BIGINT);
 
 	auto inputs = BindMergeInputs(context, table, files);
-	DuckLakeSortedMergePlanner planner(context, table, inputs, row_group_size * ROW_GROUPS_PER_KEY_SEGMENT,
-	                                   inputs.size());
+	DuckLakeSortedMergePlanner planner(context, table, inputs, row_group_size * ROW_GROUPS_PER_KEY_SEGMENT);
 	auto result = make_uniq<MetadataBindData>();
 	vector<DuckLakeMergeSlice> slices;
 	for (idx_t row_group = 0; planner.NextBatch(row_group_size, slices); row_group++) {
@@ -268,9 +267,18 @@ struct SortedMergeLocalState : public LocalSourceState {
 	idx_t slice_idx = 0;
 	idx_t slice_offset = 0;
 	unordered_map<idx_t, SortedMergeInputCursor> cursors;
-	vector<LogicalType> payload_types;
+	//! The columns read from the files: their positions in a decoded unit, types, table columns and output columns
 	vector<column_t> payload_columns;
-	DataChunk payload;
+	vector<LogicalType> payload_types;
+	vector<column_t> payload_scan_columns;
+	vector<idx_t> payload_output_columns;
+	//! The sort key columns, decoded from the batch's sort keys instead of read from the files
+	vector<idx_t> key_output_columns;
+	vector<OrderModifiers> key_modifiers;
+	DataChunk decoded_keys;
+	//! The sort keys of the current batch's rows in merged order, and how many are emitted
+	unique_ptr<DuckLakeMergeKeys> batch_keys;
+	idx_t key_offset = 0;
 };
 
 //! Units take at most this fraction of the memory limit across all inputs
@@ -286,15 +294,19 @@ static unique_ptr<SortedMergeGlobalState> InitSortedMergeGlobal(ClientContext &c
 	result->inputs = BindMergeInputs(context, bind_data.table, bind_data.files);
 	// every input keeps about one unit decoded, so size units to keep that a small part of the memory limit
 	auto max_memory = BufferManager::GetBufferManager(context).GetMaxMemory();
-	// load key segments ahead only when the memory limit leaves room for at least one per input
+	result->planner = make_uniq<DuckLakeSortedMergePlanner>(context, bind_data.table, result->inputs,
+	                                                        bind_data.row_group_size * ROW_GROUPS_PER_KEY_SEGMENT);
+	// load key segments ahead only when the memory limit leaves room for at least one per input, unless the merge
+	// reads nothing but sort keys
 	auto input_count = result->inputs.size();
 	auto segments_ahead = max_memory / KEY_SEGMENT_MEMORY;
-	if (segments_ahead < 2 * input_count) {
+	auto keys_only = result->planner->DecodableColumns().size() == bind_data.table.GetColumns().PhysicalColumnCount();
+	if (keys_only) {
+		segments_ahead = MaxValue(segments_ahead, 2 * input_count);
+	} else if (segments_ahead < 2 * input_count) {
 		segments_ahead = input_count;
 	}
-	result->planner =
-	    make_uniq<DuckLakeSortedMergePlanner>(context, bind_data.table, result->inputs,
-	                                          bind_data.row_group_size * ROW_GROUPS_PER_KEY_SEGMENT, segments_ahead);
+	result->planner->SetMaxSegmentsAhead(segments_ahead);
 	for (idx_t input_idx = 0; input_idx < result->inputs.size(); input_idx++) {
 		result->readers.push_back(make_uniq<SortedMergeInputReader>());
 	}
@@ -312,11 +324,26 @@ static unique_ptr<SortedMergeGlobalState> InitSortedMergeGlobal(ClientContext &c
 static unique_ptr<SortedMergeLocalState> InitSortedMergeLocal(const SortedMergeBindData &bind_data,
                                                               SortedMergeGlobalState &gstate) {
 	auto result = make_uniq<SortedMergeLocalState>(gstate);
-	for (auto &column : bind_data.table.GetColumns().Physical()) {
-		result->payload_columns.push_back(result->payload_types.size());
-		result->payload_types.push_back(column.Type());
+	auto &key_columns = gstate.planner->DecodableColumns();
+	vector<LogicalType> key_types;
+	for (auto &column_idx : key_columns) {
+		result->key_output_columns.push_back(column_idx);
+		key_types.push_back(bind_data.table.GetColumns().GetColumn(PhysicalIndex(column_idx)).Type());
 	}
-	result->payload.InitializeEmpty(result->payload_types);
+	idx_t column_idx = 0;
+	for (auto &column : bind_data.table.GetColumns().Physical()) {
+		if (std::find(key_columns.begin(), key_columns.end(), column_idx) == key_columns.end()) {
+			result->payload_columns.push_back(result->payload_types.size());
+			result->payload_types.push_back(column.Type());
+			result->payload_scan_columns.push_back(column_idx);
+			result->payload_output_columns.push_back(column_idx);
+		}
+		column_idx++;
+	}
+	if (!key_types.empty()) {
+		result->key_modifiers = gstate.planner->Modifiers();
+		result->decoded_keys.Initialize(Allocator::DefaultAllocator(), key_types);
+	}
 	return std::move(result);
 }
 
@@ -324,7 +351,7 @@ static void DecodeNextUnit(ClientContext &context, const SortedMergeBindData &bi
                            SortedMergeLocalState &lstate, idx_t input_idx, SortedMergeSegmentReader &reader) {
 	auto row_number_idx = lstate.payload_columns.size();
 	if (!reader.scanner) {
-		auto column_ids = lstate.payload_columns;
+		auto column_ids = lstate.payload_scan_columns;
 		column_ids.push_back(MultiFileReader::COLUMN_IDENTIFIER_FILE_ROW_NUMBER);
 		auto filters = make_uniq<TableFilterSet>();
 		ProjectionIndex row_number_column(row_number_idx);
@@ -449,6 +476,9 @@ static void TakeUnits(ClientContext &context, const SortedMergeBindData &bind_da
 //! is no such unit to decode.
 static bool DecodeAhead(ClientContext &context, const SortedMergeBindData &bind_data, SortedMergeGlobalState &gstate,
                         SortedMergeLocalState &lstate) {
+	if (lstate.payload_columns.empty()) {
+		return false;
+	}
 	auto input_count = gstate.readers.size();
 	auto start = gstate.decode_ahead_cursor++;
 	for (idx_t i = 0; i < input_count; i++) {
@@ -500,7 +530,7 @@ enum class SortedMergeBatchResult : uint8_t { LOADED, FINISHED, PARKED };
 static SortedMergeBatchResult LoadSortedMergeBatch(ClientContext &context, const SortedMergeBindData &bind_data,
                                                    SortedMergeGlobalState &gstate, SortedMergeLocalState &lstate,
                                                    OperatorSourceInput &input) {
-	// a worker over the limit decodes ahead for the next batches before it parks
+	// a worker over the limit loads sort keys and decodes units ahead for the next batches before it parks
 	bool nothing_to_decode = false;
 	while (true) {
 		annotated_unique_lock<annotated_mutex> guard(gstate.lock);
@@ -533,7 +563,7 @@ static SortedMergeBatchResult LoadSortedMergeBatch(ClientContext &context, const
 			}
 			if (!nothing_to_decode) {
 				guard.unlock();
-				nothing_to_decode = !DecodeAhead(context, bind_data, gstate, lstate);
+				nothing_to_decode = !gstate.planner->Prefetch() && !DecodeAhead(context, bind_data, gstate, lstate);
 				continue;
 			}
 			if (gstate.BlockTask(input.interrupt_state)) {
@@ -567,7 +597,12 @@ static SortedMergeBatchResult LoadSortedMergeBatch(ClientContext &context, const
 			}
 			guard.try_lock();
 		}
-		if (!gstate.planner->NextBatch(bind_data.row_group_size, lstate.slices)) {
+		if (!lstate.key_output_columns.empty()) {
+			lstate.batch_keys = make_uniq<DuckLakeMergeKeys>();
+			lstate.batch_keys->keys.reserve(bind_data.row_group_size);
+			lstate.key_offset = 0;
+		}
+		if (!gstate.planner->NextBatch(bind_data.row_group_size, lstate.slices, lstate.batch_keys.get())) {
 			{
 				annotated_lock_guard<annotated_mutex> admission_guard(gstate.lock);
 				gstate.batches_in_flight--;
@@ -587,6 +622,10 @@ static SortedMergeBatchResult LoadSortedMergeBatch(ClientContext &context, const
 				continue;
 			}
 			entry->second.row_end = slice.row_end;
+		}
+		if (lstate.payload_columns.empty()) {
+			// every column is decoded from the sort keys, nothing is read from the files
+			lstate.cursors.clear();
 		}
 		for (auto &entry : lstate.cursors) {
 			auto &reader = *gstate.readers[entry.first];
@@ -615,8 +654,9 @@ static void FinishSortedMergeBatch(ExecutionContext &context, const PhysicalOper
 	for (auto &slice : lstate.slices) {
 		batch_rows += slice.row_count;
 	}
-	// release the decode units of the batch
+	// release the decode units and sort keys of the batch
 	lstate.cursors.clear();
+	lstate.batch_keys.reset();
 	lstate.has_batch = false;
 	{
 		annotated_lock_guard<annotated_mutex> guard(gstate.lock);
@@ -639,6 +679,7 @@ static void FinishSortedMergeBatch(ExecutionContext &context, const PhysicalOper
 			info["Batches"] = to_string(gstate.batches_emitted);
 			info["Parks"] = to_string(gstate.parks);
 			info["Units Decoded Ahead"] = to_string(gstate.units_decoded_ahead.load());
+			info["Columns From Sort Keys"] = to_string(gstate.planner->DecodableColumns().size());
 			info["Decode Unit Bytes"] = to_string(gstate.unit_size_bytes);
 			auto &metrics = context.thread.profiler.GetOperatorMetrics(op);
 			metrics.name = op.GetName();
@@ -691,32 +732,65 @@ static idx_t PositionCursor(SortedMergeInputCursor &cursor, const DuckLakeMergeS
 	return cursor.scan_state.next_row_index - cursor.unit_row;
 }
 
+//! Decode the sort key columns of the next count rows of the batch into the output from row output_offset
+static void DecodeKeyColumns(SortedMergeLocalState &lstate, DataChunk &output, idx_t output_offset, idx_t count) {
+	auto &keys = lstate.batch_keys->keys;
+	lstate.decoded_keys.Reset();
+	for (idx_t i = 0; i < count; i++) {
+		CreateSortKeyHelpers::DecodeSortKey(keys[lstate.key_offset + i], lstate.decoded_keys, i, lstate.key_modifiers);
+	}
+	lstate.decoded_keys.SetCardinality(count);
+	for (idx_t c = 0; c < lstate.key_output_columns.size(); c++) {
+		VectorOperations::Copy(lstate.decoded_keys.data[c], output.data[lstate.key_output_columns[c]], count, 0,
+		                       output_offset);
+	}
+	lstate.key_offset += count;
+}
+
 static void EmitSortedMergeRows(SortedMergeLocalState &lstate, DataChunk &output) {
 	auto start = output.size();
+	auto decode_keys = !lstate.key_output_columns.empty();
+	auto output_count = start;
 	SelectionVector sel(STANDARD_VECTOR_SIZE);
-	while (output.size() < STANDARD_VECTOR_SIZE && lstate.slice_idx < lstate.slices.size()) {
+	while (output_count < STANDARD_VECTOR_SIZE && lstate.slice_idx < lstate.slices.size()) {
 		auto &slice = lstate.slices[lstate.slice_idx];
-		auto &cursor = lstate.cursors[slice.input_idx];
-		auto available = PositionCursor(cursor, slice);
-		if (lstate.slice_offset == 0 &&
-		    cursor.units[cursor.unit_idx]->row_numbers[cursor.unit_row] != slice.row_start) {
-			throw InternalException("Sorted merge expected file row %llu of input %llu but found %llu", slice.row_start,
-			                        slice.input_idx, cursor.units[cursor.unit_idx]->row_numbers[cursor.unit_row]);
+		auto count = MinValue(slice.row_count - lstate.slice_offset, STANDARD_VECTOR_SIZE - output_count);
+		if (!lstate.payload_columns.empty()) {
+			auto &cursor = lstate.cursors[slice.input_idx];
+			auto available = PositionCursor(cursor, slice);
+			if (lstate.slice_offset == 0 &&
+			    cursor.units[cursor.unit_idx]->row_numbers[cursor.unit_row] != slice.row_start) {
+				throw InternalException("Sorted merge expected file row %llu of input %llu but found %llu",
+				                        slice.row_start, slice.input_idx,
+				                        cursor.units[cursor.unit_idx]->row_numbers[cursor.unit_row]);
+			}
+			count = MinValue(count, available);
+			auto chunk_offset = cursor.unit_row - cursor.scan_state.current_row_index;
+			for (idx_t i = 0; i < count; i++) {
+				sel.set_index(i, chunk_offset + i);
+			}
+			if (decode_keys) {
+				for (idx_t c = 0; c < lstate.payload_columns.size(); c++) {
+					VectorOperations::Copy(cursor.chunk.data[c], output.data[lstate.payload_output_columns[c]], sel,
+					                       count, 0, output_count);
+				}
+			} else {
+				output.Append(cursor.chunk, sel, count);
+			}
+			cursor.unit_row += count;
 		}
-		auto count = MinValue(slice.row_count - lstate.slice_offset, available);
-		count = MinValue(count, STANDARD_VECTOR_SIZE - output.size());
-		auto chunk_offset = cursor.unit_row - cursor.scan_state.current_row_index;
-		for (idx_t i = 0; i < count; i++) {
-			sel.set_index(i, chunk_offset + i);
-		}
-		output.Append(cursor.chunk, sel, count);
+		output_count += count;
 
-		cursor.unit_row += count;
 		lstate.slice_offset += count;
 		if (lstate.slice_offset == slice.row_count) {
 			lstate.slice_idx++;
 			lstate.slice_offset = 0;
 		}
+	}
+	if (decode_keys) {
+		// the sort keys are in merged order, so the key columns of every slice decode at once
+		DecodeKeyColumns(lstate, output, start, output_count - start);
+		output.SetCardinality(output_count);
 	}
 	lstate.batch_bytes += SinkBytes(output, start);
 }

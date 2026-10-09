@@ -6,6 +6,7 @@
 #include "duckdb/execution/column_binding_resolver.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
 #include "functions/ducklake_compaction_functions.hpp"
 #include "storage/ducklake_multi_file_list.hpp"
@@ -161,7 +162,7 @@ private:
 
 //! The sort keys of a chunk of an input, in file order
 struct DuckLakeSortedMergePlanner::KeyChunk {
-	unique_ptr<Vector> sort_keys;
+	shared_ptr<Vector> sort_keys;
 	vector<MergeKey> keys;
 	vector<idx_t> row_numbers;
 };
@@ -196,7 +197,7 @@ struct DuckLakeSortedMergePlanner::MergeInput {
 	idx_t segment_rows = 0;
 
 	//! The rest is only used by the merge
-	unique_ptr<Vector> sort_keys;
+	shared_ptr<Vector> sort_keys;
 	vector<MergeKey> keys;
 	vector<idx_t> row_numbers;
 	idx_t position = 0;
@@ -228,9 +229,8 @@ static constexpr idx_t MAX_INPUT_SEGMENTS_AHEAD = 2;
 
 DuckLakeSortedMergePlanner::DuckLakeSortedMergePlanner(ClientContext &context, DuckLakeTableEntry &table,
                                                        const vector<unique_ptr<DuckLakeFileScanBind>> &inputs,
-                                                       idx_t segment_size, idx_t max_segments_ahead)
-    : context(context), table(table), inputs(inputs), segment_size(MaxValue<idx_t>(segment_size, 1)),
-      max_segments_ahead(max_segments_ahead) {
+                                                       idx_t segment_size)
+    : context(context), table(table), inputs(inputs), segment_size(MaxValue<idx_t>(segment_size, 1)) {
 	auto sort_data = table.GetSortData();
 	if (!sort_data) {
 		throw InvalidInputException("Table \"%s\" has no sort key to merge on", table.name);
@@ -260,11 +260,21 @@ DuckLakeSortedMergePlanner::DuckLakeSortedMergePlanner(ClientContext &context, D
 	scan_column_ids.push_back(MultiFileReader::COLUMN_IDENTIFIER_FILE_ROW_NUMBER);
 
 	ColumnBindingResolver resolver(std::move(bindings), std::move(binding_types));
+	set<idx_t> decodable;
 	for (auto &order : orders) {
 		resolver.VisitExpression(&order.expression);
+		if (order.expression->GetExpressionType() == ExpressionType::BOUND_REF) {
+			auto column_idx = scan_column_ids[order.expression->Cast<BoundReferenceExpression>().Index()];
+			if (decodable.insert(column_idx).second) {
+				decodable_columns.push_back(column_idx);
+			}
+		}
 		modifiers.emplace_back(order.type, order.null_order);
 		key_types.push_back(order.expression->GetReturnType());
 		key_expressions.push_back(std::move(order.expression));
+	}
+	if (decodable_columns.size() != key_expressions.size()) {
+		decodable_columns.clear();
 	}
 
 	for (idx_t input_idx = 0; input_idx < inputs.size(); input_idx++) {
@@ -329,7 +339,7 @@ void DuckLakeSortedMergePlanner::LoadKeys(MergeInput &input, KeySegment &segment
 	auto chunk = make_uniq<KeyChunk>();
 	segment.key_chunk.Reset();
 	segment.executor->Execute(segment.scan_chunk, segment.key_chunk);
-	chunk->sort_keys = make_uniq<Vector>(LogicalType::BLOB, count);
+	chunk->sort_keys = make_shared_ptr<Vector>(LogicalType::BLOB, count);
 	CreateSortKeyHelpers::CreateSortKey(segment.key_chunk, modifiers, *chunk->sort_keys);
 	chunk->keys.reserve(count);
 	for (auto entry : chunk->sort_keys->Values<string_t>()) {
@@ -543,9 +553,13 @@ optional_idx DuckLakeSortedMergePlanner::NextRow(idx_t input_idx) const {
 	return input.row_numbers[input.position];
 }
 
-bool DuckLakeSortedMergePlanner::NextBatch(idx_t max_rows, vector<DuckLakeMergeSlice> &slices) {
+bool DuckLakeSortedMergePlanner::NextBatch(idx_t max_rows, vector<DuckLakeMergeSlice> &slices,
+                                           optional_ptr<DuckLakeMergeKeys> keys) {
 	if (!initialized) {
 		Initialize();
+	}
+	if (keys) {
+		key_owners.assign(merge_inputs.size(), nullptr);
 	}
 	slices.clear();
 	idx_t planned = 0;
@@ -568,6 +582,15 @@ bool DuckLakeSortedMergePlanner::NextBatch(idx_t max_rows, vector<DuckLakeMergeS
 			auto run_end = RunEnd(input, MinValue(input.position + known_rows, end), end, next_input);
 			known_rows = 0;
 			if (run_end > input.position) {
+				if (keys) {
+					if (key_owners[input.input_idx] != input.sort_keys.get()) {
+						key_owners[input.input_idx] = input.sort_keys.get();
+						keys->owners.push_back(input.sort_keys);
+					}
+					for (idx_t row = input.position; row < run_end; row++) {
+						keys->keys.push_back(input.keys[row].key);
+					}
+				}
 				slice.row_end = input.row_numbers[run_end - 1] + 1;
 				slice.row_count += run_end - input.position;
 				planned += run_end - input.position;

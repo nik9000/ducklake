@@ -435,3 +435,63 @@ query II
 SELECT count(*), sum(row_count) FROM ducklake_sorted_merge_plan('ducklake', 'gaps', row_group_size := 100, summary := true)
 ----
 170	17000
+
+# sort key columns of mixed types are decoded from the sort keys instead of read again
+statement ok
+CREATE TABLE ducklake.decoded (payload VARCHAR, s VARCHAR, d DATE, n DECIMAL(10, 2), f DOUBLE)
+
+statement ok
+ALTER TABLE ducklake.decoded SET SORTED BY (s DESC NULLS FIRST, d ASC NULLS LAST, n, f DESC)
+
+loop i 0 3
+
+statement ok
+INSERT INTO ducklake.decoded
+SELECT 'p' || r || '_' || {i}, CASE WHEN r % 7 = 0 THEN NULL ELSE 'key ' || (r % 13) || repeat('x', r % 20) END,
+       CASE WHEN r % 11 = 0 THEN NULL ELSE DATE '2024-01-01' + (r % 17)::INTEGER END, (r % 5) * 1.25, (r % 3) / 3.0
+FROM range({i}, 3000, 3) t(r)
+
+endloop
+
+statement ok
+CREATE TEMP TABLE merged_decoded AS FROM ducklake_sorted_merge('ducklake', 'decoded', row_group_size := 250)
+
+query I
+SELECT count(*) FROM (SELECT rowid, * FROM merged_decoded) m
+FULL OUTER JOIN (SELECT row_number() OVER (ORDER BY s DESC NULLS FIRST, d ASC NULLS LAST, n, f DESC, payload) - 1 AS rowid, *
+                 FROM ducklake.decoded) e USING (rowid)
+WHERE m.s IS DISTINCT FROM e.s OR m.d IS DISTINCT FROM e.d OR m.n IS DISTINCT FROM e.n OR m.f IS DISTINCT FROM e.f
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT * FROM merged_decoded EXCEPT ALL SELECT * FROM ducklake.decoded)
+----
+0
+
+# every column is in the sort key, so nothing is read from the files
+statement ok
+CREATE TABLE ducklake.all_keys (s VARCHAR, k BIGINT)
+
+statement ok
+ALTER TABLE ducklake.all_keys SET SORTED BY (s, k DESC)
+
+loop i 0 3
+
+statement ok
+INSERT INTO ducklake.all_keys SELECT 'host' || (r % 10), r FROM range({i}, 5000, 3) t(r)
+
+endloop
+
+statement ok
+DELETE FROM ducklake.all_keys WHERE k % 4 = 0
+
+statement ok
+CREATE TEMP TABLE merged_all_keys AS FROM ducklake_sorted_merge('ducklake', 'all_keys', row_group_size := 300)
+
+query I
+SELECT count(*) FROM (SELECT rowid, s, k FROM merged_all_keys) m
+FULL OUTER JOIN (SELECT row_number() OVER (ORDER BY s, k DESC) - 1 AS rowid, s, k FROM ducklake.all_keys) e USING (rowid)
+WHERE m.s IS DISTINCT FROM e.s OR m.k IS DISTINCT FROM e.k
+----
+0
