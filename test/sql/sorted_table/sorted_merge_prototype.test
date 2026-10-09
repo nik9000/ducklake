@@ -41,7 +41,7 @@ INSERT INTO ducklake.t SELECT i, 'c' || i FROM range(2000, 3000) r(i)
 
 # interleaved files alternate every row, the disjoint file is one slice per row group it spans
 query III
-SELECT input_index, count(*), sum(row_count) FROM ducklake_sorted_merge_plan('ducklake', 't', row_group_size := 500)
+SELECT input_index, count(*), sum(row_count) FROM ducklake_sorted_merge_sequence('ducklake', 't', row_group_size := 500)
 GROUP BY ALL ORDER BY ALL
 ----
 0	334	334
@@ -49,7 +49,7 @@ GROUP BY ALL ORDER BY ALL
 2	3	1000
 
 query II
-SELECT row_group, sum(row_count) FROM ducklake_sorted_merge_plan('ducklake', 't', row_group_size := 500)
+SELECT row_group, sum(row_count) FROM ducklake_sorted_merge_sequence('ducklake', 't', row_group_size := 500)
 GROUP BY ALL ORDER BY ALL
 ----
 0	500
@@ -58,7 +58,7 @@ GROUP BY ALL ORDER BY ALL
 3	167
 
 query IIII
-FROM ducklake_sorted_merge_plan('ducklake', 't', row_group_size := 500, summary := true)
+FROM ducklake_sorted_merge_sequence('ducklake', 't', row_group_size := 500, summary := true)
 ----
 0	500	2	500
 1	168	3	500
@@ -100,7 +100,7 @@ statement ok
 INSERT INTO ducklake.ties VALUES (1, 1), (1, 1), (2, 1), (2, 1), (3, 1)
 
 query III
-SELECT input_index, row_start, row_count FROM ducklake_sorted_merge_plan('ducklake', 'ties')
+SELECT input_index, row_start, row_count FROM ducklake_sorted_merge_sequence('ducklake', 'ties')
 ----
 0	0	3
 1	0	2
@@ -230,7 +230,7 @@ WHERE m.k IS DISTINCT FROM e.k OR m.v IS DISTINCT FROM e.v
 0
 
 query I
-SELECT sum(row_end - row_start) > sum(row_count) FROM ducklake_sorted_merge_plan('ducklake', 't', row_group_size := 37)
+SELECT sum(row_end - row_start) > sum(row_count) FROM ducklake_sorted_merge_sequence('ducklake', 't', row_group_size := 37)
 ----
 true
 
@@ -432,7 +432,7 @@ WHERE m.k IS DISTINCT FROM e.k OR m.s IS DISTINCT FROM e.s
 0
 
 query II
-SELECT count(*), sum(row_count) FROM ducklake_sorted_merge_plan('ducklake', 'gaps', row_group_size := 100, summary := true)
+SELECT count(*), sum(row_count) FROM ducklake_sorted_merge_sequence('ducklake', 'gaps', row_group_size := 100, summary := true)
 ----
 170	17000
 
@@ -495,3 +495,38 @@ FULL OUTER JOIN (SELECT row_number() OVER (ORDER BY s, k DESC) - 1 AS rowid, s, 
 WHERE m.s IS DISTINCT FROM e.s OR m.k IS DISTINCT FROM e.k
 ----
 0
+
+# with more inputs than decode units fit the memory budget for, workers do not decode ahead
+statement ok
+CREATE TABLE ducklake.fan_in (k INTEGER, payload VARCHAR)
+
+statement ok
+ALTER TABLE ducklake.fan_in SET SORTED BY (k)
+
+loop i 0 8
+
+statement ok
+INSERT INTO ducklake.fan_in SELECT r * 8 + {i}, 'p' || r FROM range(500) t(r)
+
+endloop
+
+query II
+EXPLAIN ANALYZE SELECT count(*) FROM ducklake_sorted_merge('ducklake', 'fan_in')
+----
+analyzed_plan	<!REGEX>:.*off \(too many inputs\).*
+
+statement ok
+SET memory_limit = '64MB'
+
+query II
+EXPLAIN ANALYZE SELECT count(*) FROM ducklake_sorted_merge('ducklake', 'fan_in')
+----
+analyzed_plan	<REGEX>:.*off \(too many inputs\).*
+
+query I
+SELECT count(*) FROM (SELECT k, lag(k) OVER () AS prev FROM ducklake_sorted_merge('ducklake', 'fan_in')) WHERE prev > k
+----
+0
+
+statement ok
+RESET memory_limit

@@ -144,9 +144,9 @@ public:
 	DuckLakeListFilesFunction();
 };
 
-class DuckLakeSortedMergePlanFunction : public DuckLakeBaseMetadataFunction {
+class DuckLakeSortedMergeSequenceFunction : public DuckLakeBaseMetadataFunction {
 public:
-	DuckLakeSortedMergePlanFunction();
+	DuckLakeSortedMergeSequenceFunction();
 };
 
 class DuckLakeSortedMergeFunction : public TableFunction {

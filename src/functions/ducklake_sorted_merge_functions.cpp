@@ -37,7 +37,7 @@ static DuckLakeTableEntry &BindSortedMergeTable(ClientContext &context, TableFun
 	auto schema = DuckLakeTableFunctionUtil::GetStringOption(input, "schema");
 	auto table_name = DuckLakeTableFunctionUtil::GetTableName(input.inputs[1]);
 	auto &table = DuckLakeBaseMetadataFunction::GetTableEntry(context, catalog, schema, table_name);
-	if (!DuckLakeSortedMergePlanner::HasMergeableSort(table)) {
+	if (!DuckLakeSortedMergeSequencer::HasMergeableSort(table)) {
 		throw InvalidInputException("Table \"%s\" has no sort key to merge on", table_name);
 	}
 	row_group_size = DEFAULT_ROW_GROUP_SIZE;
@@ -78,9 +78,9 @@ static vector<unique_ptr<DuckLakeFileScanBind>> BindMergeInputs(ClientContext &c
 }
 
 //===--------------------------------------------------------------------===//
-// ducklake_sorted_merge_plan
+// ducklake_sorted_merge_sequence
 //===--------------------------------------------------------------------===//
-static unique_ptr<FunctionData> DuckLakeSortedMergePlanBind(ClientContext &context, TableFunctionBindInput &input,
+static unique_ptr<FunctionData> DuckLakeSortedMergeSequenceBind(ClientContext &context, TableFunctionBindInput &input,
                                                             vector<LogicalType> &return_types,
                                                             vector<Identifier> &names) {
 	vector<DuckLakeFileListEntry> files;
@@ -111,10 +111,10 @@ static unique_ptr<FunctionData> DuckLakeSortedMergePlanBind(ClientContext &conte
 	return_types.emplace_back(LogicalType::BIGINT);
 
 	auto inputs = BindMergeInputs(context, table, files);
-	DuckLakeSortedMergePlanner planner(context, table, inputs, row_group_size * ROW_GROUPS_PER_KEY_SEGMENT);
+	DuckLakeSortedMergeSequencer sequencer(context, table, inputs, row_group_size * ROW_GROUPS_PER_KEY_SEGMENT);
 	auto result = make_uniq<MetadataBindData>();
 	vector<DuckLakeMergeSlice> slices;
-	for (idx_t row_group = 0; planner.NextBatch(row_group_size, slices); row_group++) {
+	for (idx_t row_group = 0; sequencer.NextBatch(row_group_size, slices); row_group++) {
 		if (summary) {
 			set<idx_t> touched_inputs;
 			idx_t row_count = 0;
@@ -144,8 +144,8 @@ static unique_ptr<FunctionData> DuckLakeSortedMergePlanBind(ClientContext &conte
 	return std::move(result);
 }
 
-DuckLakeSortedMergePlanFunction::DuckLakeSortedMergePlanFunction()
-    : DuckLakeBaseMetadataFunction("ducklake_sorted_merge_plan", DuckLakeSortedMergePlanBind) {
+DuckLakeSortedMergeSequenceFunction::DuckLakeSortedMergeSequenceFunction()
+    : DuckLakeBaseMetadataFunction("ducklake_sorted_merge_sequence", DuckLakeSortedMergeSequenceBind) {
 	AddSortedMergeArguments(GetSignature(), true);
 }
 
@@ -198,18 +198,18 @@ struct SortedMergeInputReader {
 	map<idx_t, shared_ptr<SortedMergeSegmentReader>> segments;
 	//! The first row of each admitted batch that has not yet taken its units
 	multiset<idx_t> pending_batch_starts;
-	//! Rows before this are planned, so no batch that is not yet admitted needs them
-	idx_t planned_row = 0;
+	//! Rows before this are sequenced, so no batch that is not yet admitted needs them
+	idx_t sequenced_row = 0;
 };
 
 //! The inherited lock guards the batch counts and the parked workers
 struct SortedMergeGlobalState : public GlobalSourceState {
-	//! Guards the planner
-	mutex plan_lock;
+	//! Guards the sequencer
+	mutex sequence_lock;
 	vector<unique_ptr<DuckLakeFileScanBind>> inputs;
-	unique_ptr<DuckLakeSortedMergePlanner> planner;
+	unique_ptr<DuckLakeSortedMergeSequencer> sequencer;
 	vector<unique_ptr<SortedMergeInputReader>> readers;
-	//! The batch index of the next batch the planner hands out
+	//! The batch index of the next batch the sequencer hands out
 	atomic<idx_t> next_batch_index {0};
 	idx_t max_threads = 1;
 	//! Whether the sink orders rows by batch index, so a parked worker reports the batches it has finished
@@ -218,7 +218,7 @@ struct SortedMergeGlobalState : public GlobalSourceState {
 	idx_t batches_in_flight = 0;
 	//! Workers allowed from the decoded size of the batches, as the sink measures it
 	unique_ptr<DuckLakeSortedMergeWorkerPolicy> worker_policy;
-	bool planner_exhausted = false;
+	bool sequencer_exhausted = false;
 	//! For logging and EXPLAIN ANALYZE
 	idx_t worker_limit = 0;
 	//! The range of worker limits once a batch is measured
@@ -231,6 +231,8 @@ struct SortedMergeGlobalState : public GlobalSourceState {
 	atomic<idx_t> units_decoded_ahead {0};
 	//! Where the next decode ahead starts looking, so inputs are visited in turn
 	atomic<idx_t> decode_ahead_cursor {0};
+	//! Whether workers waiting to start a batch decode units ahead
+	bool decode_ahead = true;
 	//! Decoded bytes a unit grows to before the next one starts
 	idx_t unit_size_bytes = 0;
 	//! File rows per segment, segments are aligned to row groups of this size
@@ -288,7 +290,7 @@ struct SortedMergeLocalState : public LocalSourceState {
 static constexpr idx_t UNIT_MEMORY_FRACTION = 16;
 static constexpr idx_t MIN_UNIT_SIZE_BYTES = 1ULL << 20;
 static constexpr idx_t MAX_UNIT_SIZE_BYTES = 32ULL << 20;
-//! Memory limit per segment of sort keys the planner may load ahead
+//! Memory limit per segment of sort keys the sequencer may load ahead
 static constexpr idx_t KEY_SEGMENT_MEMORY = 64ULL << 20;
 
 static unique_ptr<SortedMergeGlobalState> InitSortedMergeGlobal(ClientContext &context,
@@ -297,19 +299,14 @@ static unique_ptr<SortedMergeGlobalState> InitSortedMergeGlobal(ClientContext &c
 	result->inputs = BindMergeInputs(context, bind_data.table, bind_data.files);
 	// every input keeps about one unit decoded, so size units to keep that a small part of the memory limit
 	auto max_memory = BufferManager::GetBufferManager(context).GetMaxMemory();
-	result->planner = make_uniq<DuckLakeSortedMergePlanner>(context, bind_data.table, result->inputs,
+	result->sequencer = make_uniq<DuckLakeSortedMergeSequencer>(context, bind_data.table, result->inputs,
 	                                                        bind_data.row_group_size * ROW_GROUPS_PER_KEY_SEGMENT);
-	// load key segments ahead only when the memory limit leaves room for at least one per input, unless the merge
-	// reads nothing but sort keys
+	// load key segments ahead only when the memory limit leaves room for two per input, which takes more memory when
+	// the merge also decodes other columns
 	auto input_count = result->inputs.size();
-	auto segments_ahead = max_memory / KEY_SEGMENT_MEMORY;
-	auto keys_only = result->planner->DecodableColumns().size() == bind_data.table.GetColumns().PhysicalColumnCount();
-	if (keys_only) {
-		segments_ahead = MaxValue(segments_ahead, 2 * input_count);
-	} else if (segments_ahead < 2 * input_count) {
-		segments_ahead = input_count;
-	}
-	result->planner->SetMaxSegmentsAhead(segments_ahead);
+	auto keys_only = result->sequencer->DecodableColumns().size() == bind_data.table.GetColumns().PhysicalColumnCount();
+	auto segments_ahead = max_memory / (keys_only ? KEY_SEGMENT_MEMORY / 2 : KEY_SEGMENT_MEMORY);
+	result->sequencer->SetMaxSegmentsAhead(segments_ahead < 2 * input_count ? input_count : segments_ahead);
 	for (idx_t input_idx = 0; input_idx < result->inputs.size(); input_idx++) {
 		result->readers.push_back(make_uniq<SortedMergeInputReader>());
 	}
@@ -318,6 +315,8 @@ static unique_ptr<SortedMergeGlobalState> InitSortedMergeGlobal(ClientContext &c
 	if (bind_data.decode_unit_size.IsValid()) {
 		result->unit_size_bytes = bind_data.decode_unit_size.GetIndex();
 	}
+	// with too many inputs for units to fit the budget, decoding ahead would only add to the overrun
+	result->decode_ahead = result->unit_size_bytes * input_count <= max_memory / UNIT_MEMORY_FRACTION;
 	result->segment_size = bind_data.row_group_size;
 	result->max_threads = TaskScheduler::GetScheduler(context).NumberOfThreads();
 	result->worker_policy = make_uniq<DuckLakeSortedMergeWorkerPolicy>(result->max_threads);
@@ -327,7 +326,7 @@ static unique_ptr<SortedMergeGlobalState> InitSortedMergeGlobal(ClientContext &c
 static unique_ptr<SortedMergeLocalState> InitSortedMergeLocal(const SortedMergeBindData &bind_data,
                                                               SortedMergeGlobalState &gstate) {
 	auto result = make_uniq<SortedMergeLocalState>(gstate);
-	auto &key_columns = gstate.planner->DecodableColumns();
+	auto &key_columns = gstate.sequencer->DecodableColumns();
 	vector<LogicalType> key_types;
 	for (auto &column_idx : key_columns) {
 		result->key_output_columns.push_back(column_idx);
@@ -351,7 +350,7 @@ static unique_ptr<SortedMergeLocalState> InitSortedMergeLocal(const SortedMergeB
 		result->payload_output_columns.push_back(column_idx);
 	}
 	if (!key_types.empty()) {
-		result->key_modifiers = gstate.planner->Modifiers();
+		result->key_modifiers = gstate.sequencer->Modifiers();
 		result->decoded_keys.Initialize(Allocator::DefaultAllocator(), key_types);
 	}
 	return std::move(result);
@@ -465,7 +464,7 @@ static void TakeUnits(ClientContext &context, const SortedMergeBindData &bind_da
 	lock_guard<mutex> guard(input_reader.lock);
 	input_reader.pending_batch_starts.erase(input_reader.pending_batch_starts.find(cursor.row_start));
 	// drop the segments and units no batch can still need
-	auto needed_row = input_reader.planned_row;
+	auto needed_row = input_reader.sequenced_row;
 	if (!input_reader.pending_batch_starts.empty()) {
 		needed_row = MinValue(needed_row, *input_reader.pending_batch_starts.begin());
 	}
@@ -482,11 +481,11 @@ static void TakeUnits(ClientContext &context, const SortedMergeBindData &bind_da
 	}
 }
 
-//! Decode the unit holding the next row the planner hands out of an input, if no worker has. Returns false when there
+//! Decode the unit holding the next row the sequencer hands out of an input, if no worker has. Returns false when there
 //! is no such unit to decode.
 static bool DecodeAhead(ClientContext &context, const SortedMergeBindData &bind_data, SortedMergeGlobalState &gstate,
                         SortedMergeLocalState &lstate) {
-	if (lstate.payload_columns.empty()) {
+	if (!gstate.decode_ahead || lstate.payload_columns.empty()) {
 		return false;
 	}
 	auto input_count = gstate.readers.size();
@@ -498,7 +497,7 @@ static bool DecodeAhead(ClientContext &context, const SortedMergeBindData &bind_
 		idx_t next_row;
 		{
 			lock_guard<mutex> guard(input_reader.lock);
-			next_row = input_reader.planned_row;
+			next_row = input_reader.sequenced_row;
 			if (next_row == NumericLimits<idx_t>::Maximum()) {
 				continue;
 			}
@@ -557,12 +556,12 @@ static SortedMergeBatchResult LoadSortedMergeBatch(ClientContext &context, const
 				gstate.max_worker_limit = MaxValue(gstate.max_worker_limit, worker_limit);
 			}
 		}
-		if (gstate.planner_exhausted) {
+		if (gstate.sequencer_exhausted) {
 			return SortedMergeBatchResult::FINISHED;
 		}
 		// when the pipeline no longer lets tasks park (it is finishing), the worker goes ahead
 		if (gstate.batches_in_flight >= worker_limit && input.interrupt_state.CanCallback()) {
-			// park at the batch boundary. First report the next batch index the planner hands out, so the sink takes
+			// park at the batch boundary. First report the next batch index the sequencer hands out, so the sink takes
 			// the finished batch and moves on: every batch below it is done or being emitted by a running worker. The
 			// pipeline calls back right after taking the new index, and that call parks.
 			auto floor = gstate.next_batch_index.load();
@@ -573,7 +572,7 @@ static SortedMergeBatchResult LoadSortedMergeBatch(ClientContext &context, const
 			}
 			if (!nothing_to_decode) {
 				guard.unlock();
-				nothing_to_decode = !gstate.planner->Prefetch() && !DecodeAhead(context, bind_data, gstate, lstate);
+				nothing_to_decode = !gstate.sequencer->Prefetch() && !DecodeAhead(context, bind_data, gstate, lstate);
 				continue;
 			}
 			if (gstate.BlockTask(input.interrupt_state)) {
@@ -586,9 +585,9 @@ static SortedMergeBatchResult LoadSortedMergeBatch(ClientContext &context, const
 		break;
 	}
 	{
-		unique_lock<mutex> guard(gstate.plan_lock, std::try_to_lock);
+		unique_lock<mutex> guard(gstate.sequence_lock, std::try_to_lock);
 		while (!guard.owns_lock()) {
-			// load sort keys ahead for the worker that is planning. A worker still reporting its finished batch
+			// load sort keys ahead for the worker that is sequencing. A worker still reporting its finished batch
 			// would hold back the sink meanwhile, so it first reports the next batch index, like a parked worker.
 			auto floor = gstate.next_batch_index.load();
 			if (gstate.requires_batch_index && floor > lstate.batch_index) {
@@ -601,7 +600,7 @@ static SortedMergeBatchResult LoadSortedMergeBatch(ClientContext &context, const
 				input.batch_index_state = SourceBatchIndexState::ADVANCED;
 				return SortedMergeBatchResult::PARKED;
 			}
-			if (!gstate.planner->Prefetch()) {
+			if (!gstate.sequencer->Prefetch()) {
 				guard.lock();
 				break;
 			}
@@ -612,11 +611,11 @@ static SortedMergeBatchResult LoadSortedMergeBatch(ClientContext &context, const
 			lstate.batch_keys->keys.reserve(bind_data.row_group_size);
 			lstate.key_offset = 0;
 		}
-		if (!gstate.planner->NextBatch(bind_data.row_group_size, lstate.slices, lstate.batch_keys.get())) {
+		if (!gstate.sequencer->NextBatch(bind_data.row_group_size, lstate.slices, lstate.batch_keys.get())) {
 			{
 				annotated_lock_guard<annotated_mutex> admission_guard(gstate.lock);
 				gstate.batches_in_flight--;
-				gstate.planner_exhausted = true;
+				gstate.sequencer_exhausted = true;
 			}
 			WakeParkedWorkers(gstate);
 			return SortedMergeBatchResult::FINISHED;
@@ -641,8 +640,8 @@ static SortedMergeBatchResult LoadSortedMergeBatch(ClientContext &context, const
 			auto &reader = *gstate.readers[entry.first];
 			lock_guard<mutex> reader_guard(reader.lock);
 			reader.pending_batch_starts.insert(entry.second.row_start);
-			auto next_row = gstate.planner->NextRow(entry.first);
-			reader.planned_row = next_row.IsValid() ? next_row.GetIndex() : NumericLimits<idx_t>::Maximum();
+			auto next_row = gstate.sequencer->NextRow(entry.first);
+			reader.sequenced_row = next_row.IsValid() ? next_row.GetIndex() : NumericLimits<idx_t>::Maximum();
 		}
 	}
 	// parked workers report a higher batch index
@@ -688,8 +687,9 @@ static void FinishSortedMergeBatch(ExecutionContext &context, const PhysicalOper
 			info["Average Batch Bytes"] = to_string(gstate.worker_policy->AverageBatchBytes());
 			info["Batches"] = to_string(gstate.batches_emitted);
 			info["Parks"] = to_string(gstate.parks);
-			info["Units Decoded Ahead"] = to_string(gstate.units_decoded_ahead.load());
-			info["Columns From Sort Keys"] = to_string(gstate.planner->DecodableColumns().size());
+			info["Units Decoded Ahead"] =
+			    gstate.decode_ahead ? to_string(gstate.units_decoded_ahead.load()) : "off (too many inputs)";
+			info["Columns From Sort Keys"] = to_string(gstate.sequencer->DecodableColumns().size());
 			info["Decode Unit Bytes"] = to_string(gstate.unit_size_bytes);
 			auto &metrics = context.thread.profiler.GetOperatorMetrics(op);
 			metrics.name = op.GetName();

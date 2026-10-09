@@ -185,3 +185,31 @@ SELECT count(*) FROM (
 ) WHERE prev_k > k OR (prev_k = k AND prev_s < s)
 ----
 0
+
+# a file wrongly recorded as sorted: release builds trust the catalog, debug builds catch it
+statement ok
+CREATE TABLE ducklake.wrong (k INTEGER)
+
+statement ok
+ALTER TABLE ducklake.wrong SET SORTED BY (k)
+
+statement ok
+CALL ducklake.set_option('sort_on_insert', false, table_name => 'wrong')
+
+loop i 0 2
+
+statement ok
+INSERT INTO ducklake.wrong SELECT 1000 - r FROM range(1000) t(r)
+
+endloop
+
+statement ok
+UPDATE dl.ducklake_data_file SET sort_id = (
+	SELECT s.sort_id FROM dl.ducklake_sort_info s JOIN dl.ducklake_table t USING (table_id)
+	WHERE t.table_name = 'wrong' AND s.end_snapshot IS NULL AND t.end_snapshot IS NULL)
+WHERE table_id = (SELECT table_id FROM dl.ducklake_table WHERE table_name = 'wrong' AND end_snapshot IS NULL)
+
+statement maybe
+CALL ducklake_merge_adjacent_files('ducklake', 'wrong')
+----
+is recorded as sorted on the sort key of table "wrong" but is not

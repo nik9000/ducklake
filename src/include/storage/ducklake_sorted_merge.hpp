@@ -93,25 +93,26 @@ struct DuckLakeMergeSlice {
 	idx_t row_count;
 };
 
-//! The sort keys of planned rows in merged order, sharing the planner's key data
+//! The sort keys of sequenced rows in merged order, sharing the sequencer's key data
 struct DuckLakeMergeKeys {
 	vector<string_t> keys;
 	//! Keep the key data alive
 	vector<shared_ptr<Vector>> owners;
 };
 
-//! Plans a k-way merge of files that are each sorted on the table's sort key, reading only the key columns
-class DuckLakeSortedMergePlanner {
+//! Sequences a k-way merge of files that are each sorted on the table's sort key: which input each run of output rows
+//! comes from, reading only the key columns
+class DuckLakeSortedMergeSequencer {
 public:
 	//! Inputs are read in segments of segment_size rows
-	DuckLakeSortedMergePlanner(ClientContext &context, DuckLakeTableEntry &table,
+	DuckLakeSortedMergeSequencer(ClientContext &context, DuckLakeTableEntry &table,
 	                           const vector<unique_ptr<DuckLakeFileScanBind>> &inputs, idx_t segment_size);
-	~DuckLakeSortedMergePlanner();
+	~DuckLakeSortedMergeSequencer();
 
 	//! Whether the table has a sort key that can be merged on
 	static bool HasMergeableSort(DuckLakeTableEntry &table);
-	//! Plan the next (up to) max_rows rows in merged order, returns false once every row has been planned. When keys
-	//! is given, it receives the sort keys of the planned rows in merged order.
+	//! Sequence the next (up to) max_rows rows in merged order, returns false once every row has been sequenced. When keys
+	//! is given, it receives the sort keys of the sequenced rows in merged order.
 	bool NextBatch(idx_t max_rows, vector<DuckLakeMergeSlice> &slices, optional_ptr<DuckLakeMergeKeys> keys = nullptr);
 	//! The table columns of the sort key in order, when every sort expression is a distinct column, so their values can
 	//! be decoded from the sort keys. Empty otherwise.
@@ -121,7 +122,7 @@ public:
 	const vector<OrderModifiers> &Modifiers() const {
 		return modifiers;
 	}
-	//! The file row number of the next row of an input to be planned, invalid once every row of it is planned
+	//! The file row number of the next row of an input to be sequenced, invalid once every row of it is sequenced
 	optional_idx NextRow(idx_t input_idx) const;
 	//! Load sort keys ahead of the merge. Safe to call without holding the lock that guards NextBatch. Returns false
 	//! when there is nothing to load.
@@ -157,13 +158,13 @@ private:
 	ClientContext &context;
 	DuckLakeTableEntry &table;
 	const vector<unique_ptr<DuckLakeFileScanBind>> &inputs;
-	//! Columns scanned by the planner: the columns the sort key reads, then file_row_number
+	//! Columns scanned by the sequencer: the columns the sort key reads, then file_row_number
 	vector<column_t> scan_column_ids;
 	vector<unique_ptr<Expression>> key_expressions;
 	vector<LogicalType> key_types;
 	vector<OrderModifiers> modifiers;
 	vector<idx_t> decodable_columns;
-	//! The key data each input's keys in the batch being planned share, so it is kept alive once
+	//! The key data each input's keys in the batch being sequenced share, so it is kept alive once
 	vector<const Vector *> key_owners;
 	vector<unique_ptr<MergeInput>> merge_inputs;
 	idx_t segment_size;
