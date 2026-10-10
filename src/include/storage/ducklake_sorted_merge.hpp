@@ -104,10 +104,34 @@ struct DuckLakeMergeKeys {
 	vector<shared_ptr<Vector>> owners;
 };
 
+struct DuckLakeSortedMergeKeyChunk;
+
+//! The rows of a batch chosen by the sequencer, put in merged order by OrderBatch
+struct DuckLakeSequencedBatch {
+	//! Consecutive rows of one input: row_count rows from row offset of the first chunk on
+	struct Range {
+		idx_t input_idx = 0;
+		vector<shared_ptr<DuckLakeSortedMergeKeyChunk>> chunks;
+		idx_t offset = 0;
+		idx_t row_count = 0;
+	};
+	//! The ranges of each section the batch reads, in the order of the sections, merged within a section
+	vector<vector<Range>> parts;
+	idx_t row_count = 0;
+
+	void Clear() {
+		parts.clear();
+		row_count = 0;
+	}
+};
+
 //! Sequences a k-way merge of files that are each sorted on the table's sort key: which input each run of output rows
 //! comes from, reading only the key columns
 class DuckLakeSortedMergeSequencer {
 public:
+	static constexpr idx_t MIN_CHUNKS_AHEAD = 4;
+	static constexpr idx_t MAX_CHUNKS_AHEAD = 64;
+
 	//! Inputs are read in segments of segment_size rows
 	DuckLakeSortedMergeSequencer(ClientContext &context, DuckLakeTableEntry &table,
 	                             const vector<unique_ptr<DuckLakeFileScanBind>> &inputs, idx_t segment_size);
@@ -117,9 +141,17 @@ public:
 	static bool HasMergeableSort(DuckLakeTableEntry &table);
 	//! Read the first keys of the inputs and group them into sections, before the first batch
 	void Initialize();
-	//! Sequence the next (up to) max_rows rows in merged order, returns false once every row has been sequenced. When
-	//! keys is given, it receives the sort keys of the sequenced rows in merged order.
-	bool NextBatch(idx_t max_rows, vector<DuckLakeMergeSlice> &slices, optional_ptr<DuckLakeMergeKeys> keys = nullptr);
+	//! Choose the next (up to) max_rows rows of the merge, returns false once every row has been sequenced. Within a
+	//! section of several inputs the batch is the rows before a cut in each input, found by multisequence selection.
+	bool NextBatch(idx_t max_rows, DuckLakeSequencedBatch &batch);
+	//! Put the rows of a batch in merged order, without the lock that guards NextBatch. When keys is given, it receives
+	//! the sort keys of the rows in merged order.
+	static void OrderBatch(const DuckLakeSequencedBatch &batch, vector<DuckLakeMergeSlice> &slices,
+	                       optional_ptr<DuckLakeMergeKeys> keys = nullptr);
+	//! The rows of every input a batch reads, one slice per input
+	static void BatchInputRows(const DuckLakeSequencedBatch &batch, vector<DuckLakeMergeSlice> &input_rows);
+	//! Read about a batch's share of keys of each input ahead, for batches of batch_rows rows
+	void SetBatchRows(idx_t batch_rows);
 	//! The table columns of the sort key in order, when every sort expression is a distinct column, so their values can
 	//! be decoded from the sort keys. Empty otherwise.
 	const vector<idx_t> &DecodableColumns() const {
@@ -142,7 +174,8 @@ public:
 	void WaitForWork(idx_t seen_generation);
 	//! Whether the section being merged merges keys of several inputs, so workers can load keys ahead for it
 	bool MergingKeys() const;
-	void NotifyWaiters();
+	//! Wake a waiting worker, or all of them
+	void NotifyWaiters(bool all = false);
 	//! Whether the input is merged in the section being merged or the next one, so reading ahead for it pays off soon
 	bool InputIsNear(idx_t input_idx) const;
 	//! The number of sections of inputs whose key ranges overlap, each merged after the one before
@@ -158,10 +191,9 @@ public:
 	}
 
 private:
-	struct KeyChunk;
-	struct CurrentKey;
 	struct KeySegment;
 	struct MergeInput;
+	struct WindowSequences;
 
 	//! Read the key of the input's last row
 	void ReadLastKey(MergeInput &input);
@@ -172,30 +204,22 @@ private:
 	void MakeKeyless(MergeInput &input);
 	//! Start merging the inputs of the next section, returns false when every section is merged
 	bool StartNextSection();
-	bool LoadChunk(MergeInput &input);
+	//! Take the input's next chunk of keys into its window, returns false when every chunk is taken
+	bool TakeChunk(MergeInput &input);
+	//! Throw when the chunk's keys are not sorted, unless the catalog records the input as sorted in a release build
+	void VerifySorted(const MergeInput &input, const DuckLakeSortedMergeKeyChunk &chunk);
+	//! Move the next count rows of the input's window into the range
+	void TakeRows(MergeInput &input, idx_t count, DuckLakeSequencedBatch::Range &range);
+	//! The loaded rows of the section that come before or at the last loaded row of the frontier input
+	idx_t RowsUpTo(const MergeInput &frontier) const;
+	//! Choose the next (up to) max_rows rows of a section of several inputs
+	void SequenceSection(idx_t max_rows, vector<DuckLakeSequencedBatch::Range> &part);
 	//! Load the next chunk of keys of a segment, the caller holds the segment's lock
 	void LoadKeys(MergeInput &input, KeySegment &segment);
 	//! Load a chunk of keys into a segment that is not yet loaded far enough ahead
 	bool TopUpSegment(MergeInput &input);
 	//! Start loading the next segment of the input with the fewest segments loaded ahead
 	bool StartSegment();
-	//! Whether the current row of lhs comes before the current row of rhs in the merged order
-	bool InputBefore(const MergeInput &lhs, const MergeInput &rhs) const;
-	//! The end of the run of rows in [input.position, end) that come before the current row of next, given that
-	//! the rows before start do
-	idx_t RunEnd(const MergeInput &input, idx_t start, idx_t end, optional_ptr<MergeInput> next) const;
-	//! Whether an input of the section being merged has rows left
-	bool SectionActive() const;
-	//! Whether the current row of lhs comes before the current row of rhs, an invalid or exhausted input never does
-	bool Wins(idx_t lhs, idx_t rhs) const;
-	//! Build the loser tree of a section's inputs: each node holds the input that lost there, the root the winner
-	void BuildTree(const vector<idx_t> &section_inputs);
-	//! Record the input's current key for the tree, after its current row changed
-	void RefreshKey(const MergeInput &input);
-	//! Restore the tree after the input's current row changed, from its leaf up
-	void Replay(const MergeInput &input);
-	//! The input whose current row comes first after the winner's
-	optional_ptr<MergeInput> RunnerUp(const MergeInput &winner) const;
 
 private:
 	ClientContext &context;
@@ -208,8 +232,6 @@ private:
 	vector<OrderModifiers> modifiers;
 	vector<idx_t> decodable_columns;
 	vector<idx_t> no_columns;
-	//! The key data each input's keys in the batch being sequenced share, so it is kept alive once
-	vector<const Vector *> key_owners;
 	vector<unique_ptr<MergeInput>> merge_inputs;
 	idx_t segment_size;
 	atomic<idx_t> max_segments_ahead {0};
@@ -220,9 +242,10 @@ private:
 	mutex waiters_lock;
 	std::condition_variable waiters;
 	atomic<idx_t> wait_generation {0};
-	//! The loser tree of the section being merged: tree[0] is the winner, tree[node] the input that lost at node
-	vector<idx_t> tree;
-	vector<CurrentKey> current_keys;
+	//! The inputs of the section being merged that have rows left, by input
+	vector<idx_t> section_inputs;
+	//! Chunks of keys each segment loads ahead of the merge
+	atomic<idx_t> chunks_ahead {MIN_CHUNKS_AHEAD};
 	atomic<bool> initialized {false};
 	//! Inputs grouped into sections of overlapping key ranges, in key order
 	vector<vector<idx_t>> sections;

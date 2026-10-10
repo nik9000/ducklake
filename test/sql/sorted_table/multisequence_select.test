@@ -1,0 +1,116 @@
+# name: test/sql/sorted_table/multisequence_select.test
+# description: multisequence selection finds how many rows of each sorted list come before the rank-th row of their merge
+# group: [sorted_table]
+
+require ducklake
+
+# interleaved lists
+query I
+SELECT ducklake_multisequence_select([[1, 4, 7, 10], [2, 5, 8, 11], [3, 6, 9, 12]], [0, 0, 0], 6).cuts
+----
+[2, 2, 2]
+
+# equal keys come from earlier lists first
+query I
+SELECT ducklake_multisequence_select([[1, 1, 1], [1, 1], [1]], [0, 0, 0], 4).cuts
+----
+[3, 1, 0]
+
+# rows before the starts are not counted
+query I
+SELECT ducklake_multisequence_select([[1, 4, 7, 10], [2, 5, 8, 11]], [2, 1], 3).cuts
+----
+[3, 3]
+
+# a rank past the rows takes every row, a rank of zero none
+query II
+SELECT ducklake_multisequence_select([[1, 2], [], [3]], [0, 0, 0], 5).cuts,
+       ducklake_multisequence_select([[1, 2], [], [3]], [1, 0, 0], 0).cuts
+----
+[2, 0, 1]	[1, 0, 0]
+
+# one list
+query I
+SELECT ducklake_multisequence_select([[5, 6, 7, 8, 9]], [1], 2).cuts
+----
+[3]
+
+statement error
+SELECT ducklake_multisequence_select([[1, 2]], [3], 1)
+----
+out of range
+
+# Random cases against a brute-force merge: lists of up to 40 keys with few distinct values, random starts and ranks up
+# to past the rows. Most cases have up to 8 lists, some up to 200.
+statement ok
+CREATE TABLE lists AS
+SELECT case_id, list_idx
+FROM range(600) c(case_id), range(200) l(list_idx)
+WHERE list_idx < CASE WHEN case_id < 550 THEN 1 + hash(case_id, 'lists') % 8 ELSE 1 + hash(case_id, 'lists') % 200 END
+
+statement ok
+CREATE TABLE rows AS
+SELECT case_id, list_idx, key, row_number() OVER (PARTITION BY case_id, list_idx ORDER BY key) - 1 AS pos
+FROM (
+	SELECT case_id, list_idx, (hash(case_id, list_idx, i) % (1 + hash(case_id, 'distinct') % 50))::BIGINT AS key
+	FROM lists, LATERAL (SELECT * FROM range((hash(case_id, list_idx, 'length') % 41)::BIGINT)) t(i)
+)
+
+statement ok
+CREATE TABLE starts AS
+SELECT case_id, list_idx, length, (hash(case_id, list_idx, 'start') % (length + 1))::BIGINT AS start
+FROM (
+	SELECT l.case_id, l.list_idx, count(r.key) AS length
+	FROM lists l LEFT JOIN rows r USING (case_id, list_idx)
+	GROUP BY ALL
+)
+
+statement ok
+CREATE TABLE ranks AS
+SELECT case_id, (hash(case_id, 'rank') % (sum(length - start) + 2))::BIGINT AS rnk, sum(length - start) AS open
+FROM starts
+GROUP BY case_id
+
+statement ok
+CREATE TABLE merged AS
+SELECT r.case_id, r.list_idx, row_number() OVER (PARTITION BY r.case_id ORDER BY r.key, r.list_idx) AS merged_rank
+FROM rows r JOIN starts s USING (case_id, list_idx)
+WHERE r.pos >= s.start
+
+statement ok
+CREATE TABLE expected AS
+SELECT s.case_id, s.list_idx, s.start + count(m.case_id) AS cut
+FROM starts s
+JOIN ranks k USING (case_id)
+LEFT JOIN merged m ON m.case_id = s.case_id AND m.list_idx = s.list_idx AND m.merged_rank <= k.rnk
+GROUP BY s.case_id, s.list_idx, s.start
+
+statement ok
+CREATE TABLE actual AS
+SELECT case_id, open, rnk,
+       ducklake_multisequence_select(list(keys ORDER BY list_idx), list(start ORDER BY list_idx), rnk) AS selection
+FROM (
+	SELECT s.case_id, s.list_idx, s.start, coalesce(list(r.key ORDER BY r.pos) FILTER (r.key IS NOT NULL), []) AS keys
+	FROM starts s LEFT JOIN rows r USING (case_id, list_idx)
+	GROUP BY ALL
+) JOIN ranks USING (case_id)
+GROUP BY case_id, open, rnk
+
+query I
+SELECT count(*) FROM actual
+----
+600
+
+query I
+SELECT count(*)
+FROM expected e JOIN actual a USING (case_id)
+WHERE a.selection.cuts[e.list_idx + 1] <> e.cut
+----
+0
+
+# every step settles at least a quarter of the open rows
+query I
+SELECT count(*) FROM actual
+WHERE selection.steps > 2 + log(4.0 / 3.0, least(open, rnk * len(selection.cuts)) + 1)
+----
+0

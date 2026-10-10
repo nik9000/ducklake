@@ -1,4 +1,6 @@
 #include "functions/ducklake_table_functions.hpp"
+#include "duckdb/common/vector/struct_vector.hpp"
+#include "duckdb/function/scalar_function.hpp"
 #include "duckdb/common/multi_file/multi_file_reader.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/execution/partition_info.hpp"
@@ -12,6 +14,7 @@
 #include "duckdb/planner/filter/expression_filter.hpp"
 #include "storage/ducklake_catalog.hpp"
 #include "storage/ducklake_multi_file_reader.hpp"
+#include "storage/ducklake_multisequence_select.hpp"
 #include "storage/ducklake_sorted_merge.hpp"
 #include "storage/ducklake_table_entry.hpp"
 #include "storage/ducklake_transaction.hpp"
@@ -114,7 +117,9 @@ static unique_ptr<FunctionData> DuckLakeSortedMergeSequenceBind(ClientContext &c
 	DuckLakeSortedMergeSequencer sequencer(context, table, inputs, row_group_size * ROW_GROUPS_PER_KEY_SEGMENT);
 	auto result = make_uniq<MetadataBindData>();
 	vector<DuckLakeMergeSlice> slices;
-	for (idx_t row_group = 0; sequencer.NextBatch(row_group_size, slices); row_group++) {
+	DuckLakeSequencedBatch batch;
+	for (idx_t row_group = 0; sequencer.NextBatch(row_group_size, batch); row_group++) {
+		DuckLakeSortedMergeSequencer::OrderBatch(batch, slices);
 		if (summary) {
 			set<idx_t> touched_inputs;
 			idx_t row_count = 0;
@@ -279,6 +284,9 @@ struct SortedMergeLocalState : public LocalSourceState {
 	bool has_batch = false;
 	//! Decoded bytes of the rows emitted for the current batch
 	idx_t batch_bytes = 0;
+	//! The rows the sequencer chose for the batch, the rows of each input, and the rows in merged order
+	DuckLakeSequencedBatch sequenced;
+	vector<DuckLakeMergeSlice> input_rows;
 	vector<DuckLakeMergeSlice> slices;
 	idx_t slice_idx = 0;
 	idx_t slice_offset = 0;
@@ -328,6 +336,7 @@ static unique_ptr<SortedMergeGlobalState> InitSortedMergeGlobal(ClientContext &c
 	result->sequencer = make_uniq<DuckLakeSortedMergeSequencer>(context, bind_data.table, result->inputs,
 	                                                            bind_data.row_group_size * ROW_GROUPS_PER_KEY_SEGMENT);
 	result->sequencer->Initialize();
+	result->sequencer->SetBatchRows(bind_data.row_group_size);
 	// load key segments ahead only when the memory limit leaves room for two per input, which takes more memory when
 	// the merge also decodes other columns
 	auto input_count = result->inputs.size();
@@ -653,7 +662,7 @@ static SortedMergeBatchResult LoadSortedMergeBatch(ClientContext &context, const
 			lstate.batch_keys->keys.reserve(bind_data.row_group_size);
 			lstate.key_offset = 0;
 		}
-		if (!gstate.sequencer->NextBatch(bind_data.row_group_size, lstate.slices, lstate.batch_keys.get())) {
+		if (!gstate.sequencer->NextBatch(bind_data.row_group_size, lstate.sequenced)) {
 			{
 				annotated_lock_guard<annotated_mutex> admission_guard(gstate.lock);
 				gstate.batches_in_flight--;
@@ -663,15 +672,14 @@ static SortedMergeBatchResult LoadSortedMergeBatch(ClientContext &context, const
 			return SortedMergeBatchResult::FINISHED;
 		}
 		lstate.batch_index = gstate.next_batch_index++;
-		// the slices of one input in a batch cover a contiguous range of its live rows
-		for (auto &slice : lstate.slices) {
-			auto &cursor = *lstate.cursors[slice.input_idx];
-			if (!cursor.active) {
-				cursor.active = true;
-				cursor.row_start = slice.row_start;
-				lstate.batch_inputs.push_back(slice.input_idx);
-			}
-			cursor.row_end = slice.row_end;
+		// a batch reads a contiguous range of the live rows of each of its inputs
+		DuckLakeSortedMergeSequencer::BatchInputRows(lstate.sequenced, lstate.input_rows);
+		for (auto &rows : lstate.input_rows) {
+			auto &cursor = *lstate.cursors[rows.input_idx];
+			cursor.active = true;
+			cursor.row_start = rows.row_start;
+			cursor.row_end = rows.row_end;
+			lstate.batch_inputs.push_back(rows.input_idx);
 		}
 		if (lstate.payload_columns.empty()) {
 			// every column is decoded from the sort keys, nothing is read from the files
@@ -685,9 +693,23 @@ static SortedMergeBatchResult LoadSortedMergeBatch(ClientContext &context, const
 			reader.sequenced_row = next_row.IsValid() ? next_row.GetIndex() : NumericLimits<idx_t>::Maximum();
 		}
 	}
-	// a worker waiting for the sequencer can take it, and parked workers report a higher batch index
-	gstate.sequencer->NotifyWaiters();
+	// the workers waiting for the sequencer can take it, and parked workers report a higher batch index
+	gstate.sequencer->NotifyWaiters(true);
 	WakeParkedWorkers(gstate);
+	// put the batch's rows in merged order
+	DuckLakeSortedMergeSequencer::OrderBatch(lstate.sequenced, lstate.slices, lstate.batch_keys.get());
+	lstate.sequenced.Clear();
+	// take units in the order the batch first reads from each input
+	if (!lstate.batch_inputs.empty()) {
+		lstate.batch_inputs.clear();
+		vector<bool> listed(lstate.cursors.size(), false);
+		for (auto &slice : lstate.slices) {
+			if (!listed[slice.input_idx]) {
+				listed[slice.input_idx] = true;
+				lstate.batch_inputs.push_back(slice.input_idx);
+			}
+		}
+	}
 	for (auto input_idx : lstate.batch_inputs) {
 		TakeUnits(context, bind_data, gstate, lstate, input_idx, *lstate.cursors[input_idx]);
 	}
@@ -1027,6 +1049,80 @@ unique_ptr<LogicalOperator> PlanDuckLakeSortedMerge(DuckLakeTableEntry &table, v
 	bind_data->row_group_size = row_group_size;
 	bind_data->write_snapshot_id = write_snapshot_id;
 	return make_uniq<DuckLakeLogicalSortedMerge>(table_index, std::move(bind_data), std::move(return_types));
+}
+
+//===--------------------------------------------------------------------===//
+// ducklake_multisequence_select
+//===--------------------------------------------------------------------===//
+//! Sorted lists of BIGINT keys, ordered by key and then by list
+struct ListSequences {
+	vector<vector<int64_t>> keys;
+
+	idx_t Count() const {
+		return keys.size();
+	}
+	bool Less(idx_t lhs_sequence, idx_t lhs_position, idx_t rhs_sequence, idx_t rhs_position) const {
+		auto lhs = keys[lhs_sequence][lhs_position];
+		auto rhs = keys[rhs_sequence][rhs_position];
+		return lhs < rhs || (lhs == rhs && lhs_sequence < rhs_sequence);
+	}
+};
+
+static void MultisequenceSelectFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &result_children = StructVector::GetEntries(result);
+	auto &cuts_vector = result_children[0];
+	auto steps = FlatVector::GetDataMutable<int64_t>(result_children[1]);
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto sequences_value = args.GetValue(0, row);
+		auto starts_value = args.GetValue(1, row);
+		auto rank_value = args.GetValue(2, row);
+		if (sequences_value.IsNull() || starts_value.IsNull() || rank_value.IsNull()) {
+			throw InvalidInputException("ducklake_multisequence_select does not take NULL arguments");
+		}
+		ListSequences sequences;
+		vector<idx_t> starts;
+		vector<idx_t> ends;
+		auto &starts_list = ListValue::GetChildren(starts_value);
+		for (auto &sequence : ListValue::GetChildren(sequences_value)) {
+			auto &sequence_keys = sequences.keys.emplace_back();
+			for (auto &key : ListValue::GetChildren(sequence)) {
+				sequence_keys.push_back(key.GetValue<int64_t>());
+			}
+			ends.push_back(sequence_keys.size());
+		}
+		if (starts_list.size() != ends.size()) {
+			throw InvalidInputException("ducklake_multisequence_select needs a start for every sequence");
+		}
+		for (idx_t i = 0; i < ends.size(); i++) {
+			auto start = starts_list[i].GetValue<int64_t>();
+			if (start < 0 || NumericCast<idx_t>(start) > ends[i]) {
+				throw InvalidInputException("ducklake_multisequence_select start %lld is out of range", start);
+			}
+			starts.push_back(NumericCast<idx_t>(start));
+		}
+		vector<idx_t> cuts;
+		auto step_count = MultisequenceSelection<ListSequences>::Select(
+		    sequences, starts, ends, NumericCast<idx_t>(rank_value.GetValue<int64_t>()), cuts);
+		vector<Value> cut_values;
+		for (auto cut : cuts) {
+			cut_values.push_back(Value::BIGINT(NumericCast<int64_t>(cut)));
+		}
+		cuts_vector.SetValue(row, Value::LIST(LogicalType::BIGINT, std::move(cut_values)));
+		steps[row] = NumericCast<int64_t>(step_count);
+	}
+	result.SetVectorType(args.AllConstant() ? VectorType::CONSTANT_VECTOR : VectorType::FLAT_VECTOR);
+}
+
+ScalarFunction DuckLakeMultisequenceSelectFunction() {
+	child_list_t<LogicalType> result_children;
+	result_children.emplace_back("cuts", LogicalType::LIST(LogicalType::BIGINT));
+	result_children.emplace_back("steps", LogicalType::BIGINT);
+	ScalarFunction function("ducklake_multisequence_select",
+	                        {LogicalType::LIST(LogicalType::LIST(LogicalType::BIGINT)),
+	                         LogicalType::LIST(LogicalType::BIGINT), LogicalType::BIGINT},
+	                        LogicalType::STRUCT(std::move(result_children)), MultisequenceSelectFunction);
+	function.SetFallible();
+	return function;
 }
 
 //===--------------------------------------------------------------------===//

@@ -13,6 +13,7 @@
 #include "duckdb/planner/expression_iterator.hpp"
 #include "functions/ducklake_compaction_functions.hpp"
 #include "storage/ducklake_multi_file_list.hpp"
+#include "storage/ducklake_multisequence_select.hpp"
 #include "storage/ducklake_table_entry.hpp"
 #include "storage/ducklake_metadata_manager.hpp"
 #include "storage/ducklake_stats.hpp"
@@ -175,19 +176,13 @@ private:
 	}
 };
 
-//! The current key of an input in the loser tree, kept in one array so comparisons do not chase pointers
-struct DuckLakeSortedMergeSequencer::CurrentKey {
-	uint64_t high = 0;
-	uint64_t low = 0;
-	bool exhausted = true;
-};
-
 //! The sort keys of a chunk of an input, in file order, or only its row numbers when its keys are not needed
-struct DuckLakeSortedMergeSequencer::KeyChunk {
+struct DuckLakeSortedMergeKeyChunk {
 	shared_ptr<Vector> sort_keys;
 	vector<MergeKey> keys;
 	vector<idx_t> row_numbers;
 };
+using KeyChunk = DuckLakeSortedMergeKeyChunk;
 
 //! The keys of file rows [row_start, row_end) of an input, loaded a chunk at a time by whichever thread gets to it
 struct DuckLakeSortedMergeSequencer::KeySegment {
@@ -199,15 +194,30 @@ struct DuckLakeSortedMergeSequencer::KeySegment {
 	idx_t row_end;
 	//! Whether only row numbers are read
 	bool keyless;
-	mutex lock;
+	//! Held while scanning, guards the scanner
+	mutex load_lock;
 	unique_ptr<DuckLakeSingleFileScanner> scanner;
 	DataChunk scan_chunk;
 	DataChunk key_chunk;
 	unique_ptr<ExpressionExecutor> executor;
-	deque<unique_ptr<KeyChunk>> chunks;
+	//! Guards chunks, so loaded chunks can be taken while the next one is scanned
+	mutex chunks_lock;
+	deque<shared_ptr<KeyChunk>> chunks;
 	//! Readable without the lock, to find segments worth loading
 	atomic<idx_t> loaded_chunks {0};
+	//! Set after the last chunk is added to chunks
 	atomic<bool> done {false};
+
+	shared_ptr<KeyChunk> TakeLoaded() {
+		lock_guard<mutex> guard(chunks_lock);
+		if (chunks.empty()) {
+			return nullptr;
+		}
+		auto chunk = std::move(chunks.front());
+		chunks.pop_front();
+		loaded_chunks--;
+		return chunk;
+	}
 };
 
 struct DuckLakeSortedMergeSequencer::MergeInput {
@@ -221,16 +231,20 @@ struct DuckLakeSortedMergeSequencer::MergeInput {
 	//! Rows per segment, all rows in one segment when the file's row count is not known
 	idx_t segment_rows = 0;
 
-	//! The rest is only used by the merge
-	shared_ptr<Vector> sort_keys;
-	vector<MergeKey> keys;
-	vector<idx_t> row_numbers;
+	//! The rest is only used by the merge: the chunks of keys taken from the segments, from the next row to sequence
+	//! at row position of the first chunk on
+	deque<shared_ptr<KeyChunk>> window;
 	idx_t position = 0;
-	//! The last key of the previous chunk, to verify the input is sorted across chunks
+	//! The rows of the window from position on, and the end of each chunk of the window counted from its first row
+	idx_t loaded = 0;
+	vector<idx_t> window_ends;
+	//! Whether every chunk of the input has been taken into the window
+	bool fully_loaded = false;
+	bool exhausted = false;
+	//! The last key taken, to verify the input is sorted across chunks
 	string previous_key_data;
 	MergeKey previous_key;
 	bool has_previous_key = false;
-	bool exhausted = false;
 	//! The first and last key of the input, the last unknown when its last row is deleted or its row count is not known
 	string first_key;
 	string last_key;
@@ -239,13 +253,23 @@ struct DuckLakeSortedMergeSequencer::MergeInput {
 	idx_t section = 0;
 	//! Whether the input is merged alone and recorded as sorted, so its keys are not needed
 	bool keyless = false;
-	//! Whether the first chunk is loaded, which waits for the input's section when the catalog bounds its keys
-	bool loaded = false;
-	//! The input's leaf in the loser tree of its section
-	idx_t leaf = 0;
+	//! Whether the first chunk is taken, which waits for the input's section when the catalog bounds its keys
+	bool started = false;
 
-	const MergeKey &CurrentKey() const {
-		return keys[position];
+	//! The chunk and row in it of the row-th row of the window from position on
+	pair<idx_t, idx_t> Locate(idx_t row) const {
+		auto absolute = position + row;
+		auto chunk_idx = NumericCast<idx_t>(std::upper_bound(window_ends.begin(), window_ends.end(), absolute) -
+		                                    window_ends.begin());
+		return make_pair(chunk_idx, chunk_idx == 0 ? absolute : absolute - window_ends[chunk_idx - 1]);
+	}
+	const MergeKey &KeyAt(idx_t row) const {
+		auto location = Locate(row);
+		return window[location.first]->keys[location.second];
+	}
+	idx_t RowNumberAt(idx_t row) const {
+		auto location = Locate(row);
+		return window[location.first]->row_numbers[location.second];
 	}
 
 	//! Create the next segment, the caller holds segments_lock
@@ -259,8 +283,6 @@ struct DuckLakeSortedMergeSequencer::MergeInput {
 	}
 };
 
-//! Chunks a segment loads ahead of the merge
-static constexpr idx_t CHUNKS_AHEAD = 4;
 //! Segments an input loads ahead of the merge
 static constexpr idx_t MAX_INPUT_SEGMENTS_AHEAD = 2;
 
@@ -327,7 +349,6 @@ DuckLakeSortedMergeSequencer::DuckLakeSortedMergeSequencer(ClientContext &contex
 		}
 		merge_inputs.push_back(std::move(input));
 	}
-	current_keys.resize(merge_inputs.size());
 }
 
 DuckLakeSortedMergeSequencer::~DuckLakeSortedMergeSequencer() {
@@ -429,11 +450,11 @@ void DuckLakeSortedMergeSequencer::Initialize() {
 			by_first_key.push_back(input->input_idx);
 			continue;
 		}
-		input->loaded = true;
-		if (!LoadChunk(*input)) {
+		input->started = true;
+		if (!TakeChunk(*input)) {
 			continue;
 		}
-		input->first_key = input->keys[0].key.GetString();
+		input->first_key = input->KeyAt(0).key.GetString();
 		ReadLastKey(*input);
 		by_first_key.push_back(input->input_idx);
 	}
@@ -482,7 +503,7 @@ void DuckLakeSortedMergeSequencer::MakeKeyless(MergeInput &input) {
 		return;
 	}
 	// read the rest of the segments already started again, without keys
-	auto row_start = input.row_numbers.back() + 1;
+	auto row_start = input.window.back()->row_numbers.back() + 1;
 	auto row_end = input.segments.back()->row_end;
 	segments_ahead -= input.segments.size();
 	input.segments.clear();
@@ -491,106 +512,23 @@ void DuckLakeSortedMergeSequencer::MakeKeyless(MergeInput &input) {
 }
 
 bool DuckLakeSortedMergeSequencer::StartNextSection() {
-	while (!SectionActive() && next_section < sections.size()) {
+	while (section_inputs.empty() && next_section < sections.size()) {
 		active_section = next_section;
-		vector<idx_t> section_inputs;
 		for (auto input_idx : sections[next_section]) {
 			auto &input = *merge_inputs[input_idx];
-			if (!input.loaded) {
-				input.loaded = true;
-				LoadChunk(input);
+			if (!input.started) {
+				input.started = true;
+				TakeChunk(input);
 			}
 			if (!input.exhausted) {
-				RefreshKey(input);
 				section_inputs.push_back(input_idx);
 			}
 		}
-		BuildTree(section_inputs);
+		// ties between inputs are ordered by input
+		std::sort(section_inputs.begin(), section_inputs.end());
 		next_section++;
 	}
-	return SectionActive();
-}
-
-bool DuckLakeSortedMergeSequencer::SectionActive() const {
-	return !tree.empty() && tree[0] != DConstants::INVALID_INDEX && !merge_inputs[tree[0]]->exhausted;
-}
-
-bool DuckLakeSortedMergeSequencer::Wins(idx_t lhs, idx_t rhs) const {
-	if (lhs == DConstants::INVALID_INDEX || current_keys[lhs].exhausted) {
-		return false;
-	}
-	if (rhs == DConstants::INVALID_INDEX || current_keys[rhs].exhausted) {
-		return true;
-	}
-	auto &lhs_key = current_keys[lhs];
-	auto &rhs_key = current_keys[rhs];
-	if (lhs_key.high != rhs_key.high) {
-		return lhs_key.high < rhs_key.high;
-	}
-	if (lhs_key.low != rhs_key.low) {
-		return lhs_key.low < rhs_key.low;
-	}
-	return InputBefore(*merge_inputs[lhs], *merge_inputs[rhs]);
-}
-
-void DuckLakeSortedMergeSequencer::RefreshKey(const MergeInput &input) {
-	auto &current = current_keys[input.input_idx];
-	current.exhausted = input.exhausted || input.position >= input.keys.size();
-	if (!current.exhausted) {
-		auto &key = input.keys[input.position];
-		current.high = key.high;
-		current.low = key.low;
-	}
-}
-
-void DuckLakeSortedMergeSequencer::BuildTree(const vector<idx_t> &section_inputs) {
-	tree.clear();
-	if (section_inputs.empty()) {
-		return;
-	}
-	idx_t leaves = 1;
-	while (leaves < section_inputs.size()) {
-		leaves *= 2;
-	}
-	// winners of the subtrees, the leaves at [leaves, 2 * leaves)
-	vector<idx_t> winners(2 * leaves, DConstants::INVALID_INDEX);
-	for (idx_t i = 0; i < section_inputs.size(); i++) {
-		winners[leaves + i] = section_inputs[i];
-		merge_inputs[section_inputs[i]]->leaf = leaves + i;
-	}
-	tree.assign(leaves, DConstants::INVALID_INDEX);
-	for (idx_t node = leaves - 1; node >= 1; node--) {
-		auto lhs = winners[2 * node];
-		auto rhs = winners[2 * node + 1];
-		winners[node] = Wins(rhs, lhs) ? rhs : lhs;
-		tree[node] = Wins(rhs, lhs) ? lhs : rhs;
-	}
-	tree[0] = winners[1];
-}
-
-void DuckLakeSortedMergeSequencer::Replay(const MergeInput &input) {
-	auto winner = input.input_idx;
-	for (auto node = input.leaf / 2; node >= 1; node /= 2) {
-		if (Wins(tree[node], winner)) {
-			std::swap(tree[node], winner);
-		}
-	}
-	tree[0] = winner;
-}
-
-optional_ptr<DuckLakeSortedMergeSequencer::MergeInput>
-DuckLakeSortedMergeSequencer::RunnerUp(const MergeInput &winner) const {
-	// every other input lost to one of the inputs on the winner's path
-	auto runner_up = DConstants::INVALID_INDEX;
-	for (auto node = winner.leaf / 2; node >= 1; node /= 2) {
-		if (Wins(tree[node], runner_up)) {
-			runner_up = tree[node];
-		}
-	}
-	if (runner_up == DConstants::INVALID_INDEX || merge_inputs[runner_up]->exhausted) {
-		return nullptr;
-	}
-	return merge_inputs[runner_up].get();
+	return !section_inputs.empty();
 }
 
 bool DuckLakeSortedMergeSequencer::InputIsNear(idx_t input_idx) const {
@@ -628,7 +566,7 @@ void DuckLakeSortedMergeSequencer::LoadKeys(MergeInput &input, KeySegment &segme
 		return;
 	}
 	auto count = segment.scan_chunk.size();
-	auto chunk = make_uniq<KeyChunk>();
+	auto chunk = make_shared_ptr<KeyChunk>();
 	if (!segment.keyless) {
 		segment.key_chunk.Reset();
 		segment.executor->Execute(segment.scan_chunk, segment.key_chunk);
@@ -644,33 +582,32 @@ void DuckLakeSortedMergeSequencer::LoadKeys(MergeInput &input, KeySegment &segme
 	for (auto entry : row_number_vector.Values<int64_t>()) {
 		chunk->row_numbers.push_back(NumericCast<idx_t>(entry.GetValue()));
 	}
-	if (chunk->row_numbers.back() + 1 == segment.row_end) {
+	auto last = chunk->row_numbers.back() + 1 == segment.row_end;
+	{
+		lock_guard<mutex> guard(segment.chunks_lock);
+		segment.chunks.push_back(std::move(chunk));
+		segment.loaded_chunks++;
+	}
+	if (last) {
 		// the last row of the segment is loaded, release the scanner without another scan
 		segment.scanner.reset();
 		segment.done = true;
 	}
-	segment.chunks.push_back(std::move(chunk));
-	segment.loaded_chunks++;
 }
 
-bool DuckLakeSortedMergeSequencer::LoadChunk(MergeInput &input) {
-	if (!input.keys.empty()) {
-		input.previous_key_data = input.keys.back().key.GetString();
-		input.previous_key = MergeKey(
-		    string_t(input.previous_key_data.c_str(), UnsafeNumericCast<uint32_t>(input.previous_key_data.size())));
-		input.has_previous_key = true;
+bool DuckLakeSortedMergeSequencer::TakeChunk(MergeInput &input) {
+	if (input.fully_loaded) {
+		return false;
 	}
-	input.keys.clear();
-	input.row_numbers.clear();
-	input.position = 0;
-	unique_ptr<KeyChunk> chunk;
+	shared_ptr<KeyChunk> chunk;
 	while (!chunk) {
 		shared_ptr<KeySegment> segment;
 		{
 			lock_guard<mutex> guard(input.segments_lock);
 			if (input.segments.empty()) {
 				if (input.next_segment == input.segment_count) {
-					input.exhausted = true;
+					input.fully_loaded = true;
+					input.exhausted = input.loaded == 0;
 					return false;
 				}
 				input.AddSegment();
@@ -678,42 +615,60 @@ bool DuckLakeSortedMergeSequencer::LoadChunk(MergeInput &input) {
 			}
 			segment = input.segments.front();
 		}
-		lock_guard<mutex> segment_guard(segment->lock);
-		if (segment->chunks.empty() && !segment->done) {
-			LoadKeys(input, *segment);
+		chunk = segment->TakeLoaded();
+		if (!chunk && !segment->done) {
+			// no chunk is loaded yet: load one, or wait for the worker loading one
+			lock_guard<mutex> load_guard(segment->load_lock);
+			chunk = segment->TakeLoaded();
+			if (!chunk && !segment->done) {
+				LoadKeys(input, *segment);
+				chunk = segment->TakeLoaded();
+			}
 		}
-		if (!segment->chunks.empty()) {
-			chunk = std::move(segment->chunks.front());
-			segment->chunks.pop_front();
-			segment->loaded_chunks--;
+		if (!chunk && segment->done) {
+			// the last chunk can be loaded between taking chunks and seeing the segment done
+			chunk = segment->TakeLoaded();
+			if (!chunk) {
+				// every row of the segment is taken, or deleted
+				lock_guard<mutex> guard(input.segments_lock);
+				input.segments.pop_front();
+				segments_ahead--;
+			}
+		}
+		if (chunk) {
 			// wake a worker to load more keys
 			NotifyWaiters();
-		} else {
-			// every row of the segment is merged, or deleted
-			lock_guard<mutex> guard(input.segments_lock);
-			input.segments.pop_front();
-			segments_ahead--;
 		}
 	}
-	input.sort_keys = std::move(chunk->sort_keys);
-	input.keys = std::move(chunk->keys);
-	input.row_numbers = std::move(chunk->row_numbers);
-	if (input.keys.empty()) {
-		// the input is merged alone, only its row numbers are read
-		return true;
+	VerifySorted(input, *chunk);
+	if (!chunk->keys.empty()) {
+		input.previous_key_data = chunk->keys.back().key.GetString();
+		input.previous_key = KeyOf(input.previous_key_data);
+		input.has_previous_key = true;
 	}
+	auto previous_end = input.window_ends.empty() ? 0 : input.window_ends.back();
+	input.window_ends.push_back(previous_end + chunk->row_numbers.size());
+	input.loaded += chunk->row_numbers.size();
+	input.window.push_back(std::move(chunk));
+	return true;
+}
 
+void DuckLakeSortedMergeSequencer::VerifySorted(const MergeInput &input, const KeyChunk &chunk) {
+	if (chunk.keys.empty()) {
+		// the input is merged alone, only its row numbers are read
+		return;
+	}
 	auto known_sorted = inputs[input.input_idx]->known_sorted;
 #ifndef DEBUG
 	// trust the catalog, debug builds verify it
 	if (known_sorted) {
-		return true;
+		return;
 	}
 #endif
-	auto count = input.keys.size();
-	bool out_of_order = input.has_previous_key && input.keys[0] < input.previous_key;
-	for (idx_t i = 1; i < count && !out_of_order; i++) {
-		out_of_order = input.keys[i] < input.keys[i - 1];
+	auto &keys = chunk.keys;
+	bool out_of_order = input.has_previous_key && keys[0] < input.previous_key;
+	for (idx_t i = 1; i < keys.size() && !out_of_order; i++) {
+		out_of_order = keys[i] < keys[i - 1];
 	}
 	if (out_of_order) {
 		auto &path = inputs[input.input_idx]->file.file.path;
@@ -724,7 +679,37 @@ bool DuckLakeSortedMergeSequencer::LoadChunk(MergeInput &input) {
 		throw InvalidInputException("Cannot merge file \"%s\": it is not sorted on the sort key of table %s", path,
 		                            table.name);
 	}
-	return true;
+}
+
+void DuckLakeSortedMergeSequencer::TakeRows(MergeInput &input, idx_t count, DuckLakeSequencedBatch::Range &range) {
+	if (range.chunks.empty()) {
+		range.input_idx = input.input_idx;
+		range.offset = input.position;
+	}
+	range.row_count += count;
+	input.loaded -= count;
+	while (count > 0) {
+		auto &front = input.window.front();
+		auto take = MinValue(count, front->row_numbers.size() - input.position);
+		if (range.chunks.empty() || range.chunks.back() != front) {
+			range.chunks.push_back(front);
+		}
+		count -= take;
+		input.position += take;
+		if (input.position == front->row_numbers.size()) {
+			// every row of the chunk is sequenced
+			auto chunk_rows = front->row_numbers.size();
+			input.window.pop_front();
+			input.window_ends.erase(input.window_ends.begin());
+			for (auto &end : input.window_ends) {
+				end -= chunk_rows;
+			}
+			input.position = 0;
+		}
+	}
+	if (input.loaded == 0 && !TakeChunk(input)) {
+		input.exhausted = true;
+	}
 }
 
 bool DuckLakeSortedMergeSequencer::TopUpSegment(MergeInput &input) {
@@ -732,14 +717,14 @@ bool DuckLakeSortedMergeSequencer::TopUpSegment(MergeInput &input) {
 	{
 		lock_guard<mutex> guard(input.segments_lock);
 		for (auto &segment : input.segments) {
-			if (!segment->done && segment->loaded_chunks < CHUNKS_AHEAD) {
+			if (!segment->done && segment->loaded_chunks < chunks_ahead) {
 				candidates.push_back(segment);
 			}
 		}
 	}
 	for (auto &segment : candidates) {
-		unique_lock<mutex> segment_guard(segment->lock, std::try_to_lock);
-		if (segment_guard.owns_lock() && !segment->done && segment->loaded_chunks < CHUNKS_AHEAD) {
+		unique_lock<mutex> segment_guard(segment->load_lock, std::try_to_lock);
+		if (segment_guard.owns_lock() && !segment->done && segment->loaded_chunks < chunks_ahead) {
 			LoadKeys(input, *segment);
 			return true;
 		}
@@ -773,7 +758,7 @@ bool DuckLakeSortedMergeSequencer::StartSegment() {
 		segment = target->AddSegment();
 		segments_ahead++;
 	}
-	unique_lock<mutex> segment_guard(segment->lock, std::try_to_lock);
+	unique_lock<mutex> segment_guard(segment->load_lock, std::try_to_lock);
 	if (segment_guard.owns_lock() && !segment->done && segment->loaded_chunks == 0) {
 		LoadKeys(*target, *segment);
 	}
@@ -793,12 +778,16 @@ void DuckLakeSortedMergeSequencer::WaitForWork(idx_t seen_generation) {
 	waiters.wait_for(guard, std::chrono::milliseconds(10), [&]() { return wait_generation != seen_generation; });
 }
 
-void DuckLakeSortedMergeSequencer::NotifyWaiters() {
+void DuckLakeSortedMergeSequencer::NotifyWaiters(bool all) {
 	{
 		lock_guard<mutex> guard(waiters_lock);
 		wait_generation++;
 	}
-	waiters.notify_one();
+	if (all) {
+		waiters.notify_all();
+	} else {
+		waiters.notify_one();
+	}
 }
 
 bool DuckLakeSortedMergeSequencer::Prefetch() {
@@ -812,120 +801,379 @@ bool DuckLakeSortedMergeSequencer::Prefetch() {
 	return segments_ahead < max_segments_ahead && StartSegment();
 }
 
-idx_t DuckLakeSortedMergeSequencer::RunEnd(const MergeInput &input, idx_t start, idx_t end,
-                                           optional_ptr<MergeInput> next) const {
-	if (!next) {
-		return end;
-	}
-	auto &bound = next->CurrentKey();
-	auto inclusive = input.input_idx < next->input_idx;
-	auto before = [&](idx_t row) {
-		auto &key = input.keys[row];
-		return key < bound || (inclusive && key == bound);
-	};
-	// gallop to bracket the first row that does not come before the next input, then binary search
-	idx_t lo = start;
-	idx_t hi = end;
-	idx_t step = 1;
-	while (lo < end) {
-		auto probe = MinValue(lo + step - 1, end - 1);
-		if (!before(probe)) {
-			hi = probe;
-			break;
-		}
-		lo = probe + 1;
-		step *= 2;
-	}
-	while (lo < hi) {
-		auto mid = lo + (hi - lo) / 2;
-		if (before(mid)) {
-			lo = mid + 1;
-		} else {
-			hi = mid;
-		}
-	}
-	return lo;
-}
-
-bool DuckLakeSortedMergeSequencer::InputBefore(const MergeInput &lhs, const MergeInput &rhs) const {
-	auto &lhs_key = lhs.CurrentKey();
-	auto &rhs_key = rhs.CurrentKey();
-	if (lhs_key < rhs_key) {
-		return true;
-	}
-	return lhs.input_idx < rhs.input_idx && lhs_key == rhs_key;
-}
-
 optional_idx DuckLakeSortedMergeSequencer::NextRow(idx_t input_idx) const {
 	auto &input = *merge_inputs[input_idx];
 	if (input.exhausted) {
 		return optional_idx();
 	}
-	return input.row_numbers[input.position];
+	return input.RowNumberAt(0);
 }
 
-bool DuckLakeSortedMergeSequencer::NextBatch(idx_t max_rows, vector<DuckLakeMergeSlice> &slices,
-                                             optional_ptr<DuckLakeMergeKeys> keys) {
+void DuckLakeSortedMergeSequencer::SetBatchRows(idx_t batch_rows) {
+	// read about a batch's share of every input of the widest section ahead
+	idx_t widest = 1;
+	for (auto &section : sections) {
+		widest = MaxValue<idx_t>(widest, section.size());
+	}
+	auto chunks = (batch_rows + STANDARD_VECTOR_SIZE * widest - 1) / (STANDARD_VECTOR_SIZE * widest);
+	chunks_ahead = MaxValue<idx_t>(MIN_CHUNKS_AHEAD, MinValue<idx_t>(MAX_CHUNKS_AHEAD, chunks + 2));
+}
+
+//! The loaded rows of a section's inputs, ordered by key and then by input, for the multisequence selection
+struct DuckLakeSortedMergeSequencer::WindowSequences {
+	vector<const MergeInput *> sequences;
+
+	idx_t Count() const {
+		return sequences.size();
+	}
+	bool Less(idx_t lhs_sequence, idx_t lhs_position, idx_t rhs_sequence, idx_t rhs_position) const {
+		auto &lhs = sequences[lhs_sequence]->KeyAt(lhs_position);
+		auto &rhs = sequences[rhs_sequence]->KeyAt(rhs_position);
+		return lhs < rhs || (lhs_sequence < rhs_sequence && lhs == rhs);
+	}
+};
+
+idx_t DuckLakeSortedMergeSequencer::RowsUpTo(const MergeInput &frontier) const {
+	auto &bound = frontier.KeyAt(frontier.loaded - 1);
+	idx_t rows = 0;
+	for (auto input_idx : section_inputs) {
+		auto &input = *merge_inputs[input_idx];
+		if (&input == &frontier) {
+			rows += input.loaded;
+			continue;
+		}
+		// rows of earlier inputs come before equal keys of the frontier, rows of later inputs after them
+		auto inclusive = input.input_idx < frontier.input_idx;
+		idx_t lo = 0;
+		idx_t hi = input.loaded;
+		while (lo < hi) {
+			auto middle = lo + (hi - lo) / 2;
+			auto &key = input.KeyAt(middle);
+			if (key < bound || (inclusive && key == bound)) {
+				lo = middle + 1;
+			} else {
+				hi = middle;
+			}
+		}
+		rows += lo;
+	}
+	return rows;
+}
+
+void DuckLakeSortedMergeSequencer::SequenceSection(idx_t max_rows, vector<DuckLakeSequencedBatch::Range> &part) {
+	// the batch is the first max_rows rows of the section's loaded rows, as long as those all come before the first
+	// row not loaded yet: take more keys from the input whose last loaded key comes first until they do
+	while (true) {
+		optional_ptr<MergeInput> frontier;
+		for (auto input_idx : section_inputs) {
+			auto &input = *merge_inputs[input_idx];
+			if (input.fully_loaded) {
+				continue;
+			}
+			if (!frontier || input.KeyAt(input.loaded - 1) < frontier->KeyAt(frontier->loaded - 1)) {
+				frontier = &input;
+			}
+		}
+		if (!frontier || RowsUpTo(*frontier) >= max_rows) {
+			break;
+		}
+		TakeChunk(*frontier);
+	}
+	WindowSequences window_sequences;
+	vector<idx_t> starts;
+	vector<idx_t> ends;
+	for (auto input_idx : section_inputs) {
+		auto &input = *merge_inputs[input_idx];
+		window_sequences.sequences.push_back(&input);
+		starts.push_back(0);
+		ends.push_back(input.loaded);
+	}
+	vector<idx_t> cuts;
+	MultisequenceSelection<WindowSequences>::Select(window_sequences, starts, ends, max_rows, cuts);
+	for (idx_t i = 0; i < section_inputs.size(); i++) {
+		if (cuts[i] == 0) {
+			continue;
+		}
+		auto &range = part.emplace_back();
+		TakeRows(*merge_inputs[section_inputs[i]], cuts[i], range);
+	}
+}
+
+bool DuckLakeSortedMergeSequencer::NextBatch(idx_t max_rows, DuckLakeSequencedBatch &batch) {
 	if (!initialized) {
 		Initialize();
 	}
-	if (keys) {
-		key_owners.assign(merge_inputs.size(), nullptr);
+	batch.Clear();
+	while (batch.row_count < max_rows && (!section_inputs.empty() || StartNextSection())) {
+		auto remaining = max_rows - batch.row_count;
+		auto &part = batch.parts.emplace_back();
+		if (section_inputs.size() == 1) {
+			// the rows of one input are already in order
+			auto &input = *merge_inputs[section_inputs[0]];
+			auto &range = part.emplace_back();
+			while (remaining > 0 && !input.exhausted) {
+				auto take = MinValue(remaining, input.loaded);
+				TakeRows(input, take, range);
+				remaining -= take;
+			}
+		} else {
+			SequenceSection(remaining, part);
+		}
+		for (auto &range : part) {
+			batch.row_count += range.row_count;
+		}
+		// inputs without rows left leave the section
+		section_inputs.erase(std::remove_if(section_inputs.begin(), section_inputs.end(),
+		                                    [&](idx_t input_idx) { return merge_inputs[input_idx]->exhausted; }),
+		                     section_inputs.end());
 	}
+	return batch.row_count > 0;
+}
+
+void DuckLakeSortedMergeSequencer::BatchInputRows(const DuckLakeSequencedBatch &batch,
+                                                  vector<DuckLakeMergeSlice> &input_rows) {
+	input_rows.clear();
+	for (auto &part : batch.parts) {
+		for (auto &range : part) {
+			// find the range's last row
+			idx_t chunk_idx = 0;
+			idx_t row = range.offset;
+			idx_t remaining = range.row_count;
+			while (remaining > range.chunks[chunk_idx]->row_numbers.size() - row) {
+				remaining -= range.chunks[chunk_idx]->row_numbers.size() - row;
+				chunk_idx++;
+				row = 0;
+			}
+			auto row_start = range.chunks.front()->row_numbers[range.offset];
+			auto row_end = range.chunks[chunk_idx]->row_numbers[row + remaining - 1] + 1;
+			input_rows.push_back(DuckLakeMergeSlice {range.input_idx, row_start, row_end, range.row_count});
+		}
+	}
+}
+
+//! Reads the rows of a range in order
+struct RangeReader {
+	explicit RangeReader(const DuckLakeSequencedBatch::Range &range)
+	    : range(range), chunk(range.chunks[0].get()), chunk_idx(0), row(range.offset), remaining(range.row_count) {
+		CacheKey();
+	}
+
+	const DuckLakeSequencedBatch::Range &range;
+	//! The chunk of the current row
+	const KeyChunk *chunk;
+	idx_t chunk_idx;
+	idx_t row;
+	idx_t remaining;
+	//! The leading words of the current key, so most comparisons do not leave the readers
+	uint64_t high = 0;
+	uint64_t low = 0;
+
+	void CacheKey() {
+		if (remaining > 0 && !Chunk().keys.empty()) {
+			high = Key().high;
+			low = Key().low;
+		}
+	}
+
+	const KeyChunk &Chunk() const {
+		return *chunk;
+	}
+	const MergeKey &Key() const {
+		return Chunk().keys[row];
+	}
+	idx_t RowNumber() const {
+		return Chunk().row_numbers[row];
+	}
+	void Advance(idx_t count = 1) {
+		remaining -= count;
+		row += count;
+		if (remaining > 0 && row == chunk->row_numbers.size()) {
+			chunk_idx++;
+			chunk = range.chunks[chunk_idx].get();
+			row = 0;
+		}
+		CacheKey();
+	}
+	//! The rows of the current chunk from the current row on that come before bound, at least one
+	idx_t RunBefore(const MergeKey &bound, bool inclusive) const {
+		auto &keys = Chunk().keys;
+		auto end = MinValue(row + remaining, keys.size());
+		auto before = [&](idx_t i) {
+			return keys[i] < bound || (inclusive && keys[i] == bound);
+		};
+		// gallop to bracket the first row that does not come before bound, then binary search
+		idx_t lo = row + 1;
+		idx_t hi = end;
+		idx_t step = 1;
+		while (lo < end) {
+			auto probe = MinValue(lo + step - 1, end - 1);
+			if (!before(probe)) {
+				hi = probe;
+				break;
+			}
+			lo = probe + 1;
+			step *= 2;
+		}
+		while (lo < hi) {
+			auto middle = lo + (hi - lo) / 2;
+			if (before(middle)) {
+				lo = middle + 1;
+			} else {
+				hi = middle;
+			}
+		}
+		return lo - row;
+	}
+};
+
+//! Appends rows to the slices and sort keys of a batch in merged order
+struct BatchOutput {
+	BatchOutput(vector<DuckLakeMergeSlice> &slices, optional_ptr<DuckLakeMergeKeys> keys) : slices(slices), keys(keys) {
+	}
+
+	vector<DuckLakeMergeSlice> &slices;
+	optional_ptr<DuckLakeMergeKeys> keys;
+
+	//! Append the rows of a range that are already in order, a chunk at a time
+	void AppendRange(const DuckLakeSequencedBatch::Range &range) {
+		idx_t row = range.offset;
+		idx_t remaining = range.row_count;
+		for (idx_t chunk_idx = 0; remaining > 0; chunk_idx++) {
+			auto &chunk = *range.chunks[chunk_idx];
+			auto count = MinValue(remaining, chunk.row_numbers.size() - row);
+			auto has_keys = !chunk.keys.empty();
+			if (slices.empty() || slices.back().input_idx != range.input_idx || slices.back().has_keys != has_keys) {
+				DuckLakeMergeSlice slice {range.input_idx, chunk.row_numbers[row], 0, 0};
+				slice.has_keys = has_keys;
+				slices.push_back(slice);
+			}
+			slices.back().row_end = chunk.row_numbers[row + count - 1] + 1;
+			slices.back().row_count += count;
+			if (keys && has_keys) {
+				for (idx_t i = row; i < row + count; i++) {
+					keys->keys.push_back(chunk.keys[i].key);
+				}
+			}
+			remaining -= count;
+			row = 0;
+		}
+	}
+
+	//! Append the next count rows of the reader, which are in its current chunk
+	void Append(const RangeReader &reader, idx_t count = 1) {
+		auto &chunk = reader.Chunk();
+		auto has_keys = !chunk.keys.empty();
+		if (slices.empty() || slices.back().input_idx != reader.range.input_idx || slices.back().has_keys != has_keys) {
+			DuckLakeMergeSlice slice {reader.range.input_idx, reader.RowNumber(), 0, 0};
+			slice.has_keys = has_keys;
+			slices.push_back(slice);
+		}
+		slices.back().row_end = chunk.row_numbers[reader.row + count - 1] + 1;
+		slices.back().row_count += count;
+		if (keys && has_keys) {
+			for (idx_t i = reader.row; i < reader.row + count; i++) {
+				keys->keys.push_back(chunk.keys[i].key);
+			}
+		}
+	}
+};
+
+//! Merges the ranges of a section with a loser tree: each node holds the reader that lost there, the root the winner
+static void MergeRanges(const vector<DuckLakeSequencedBatch::Range> &ranges, BatchOutput &output) {
+	vector<RangeReader> readers;
+	for (auto &range : ranges) {
+		readers.emplace_back(range);
+	}
+	auto wins = [&](idx_t lhs, idx_t rhs) {
+		if (lhs == DConstants::INVALID_INDEX || readers[lhs].remaining == 0) {
+			return false;
+		}
+		if (rhs == DConstants::INVALID_INDEX || readers[rhs].remaining == 0) {
+			return true;
+		}
+		auto &lhs_reader = readers[lhs];
+		auto &rhs_reader = readers[rhs];
+		if (lhs_reader.high != rhs_reader.high) {
+			return lhs_reader.high < rhs_reader.high;
+		}
+		if (lhs_reader.low != rhs_reader.low) {
+			return lhs_reader.low < rhs_reader.low;
+		}
+		auto &lhs_key = lhs_reader.Key();
+		auto &rhs_key = rhs_reader.Key();
+		return lhs_key < rhs_key || (readers[lhs].range.input_idx < readers[rhs].range.input_idx && lhs_key == rhs_key);
+	};
+	idx_t leaves = 1;
+	while (leaves < readers.size()) {
+		leaves *= 2;
+	}
+	vector<idx_t> winners(2 * leaves, DConstants::INVALID_INDEX);
+	for (idx_t i = 0; i < readers.size(); i++) {
+		winners[leaves + i] = i;
+	}
+	vector<idx_t> tree(leaves, DConstants::INVALID_INDEX);
+	for (idx_t node = leaves - 1; node >= 1; node--) {
+		auto lhs = winners[2 * node];
+		auto rhs = winners[2 * node + 1];
+		winners[node] = wins(rhs, lhs) ? rhs : lhs;
+		tree[node] = wins(rhs, lhs) ? lhs : rhs;
+	}
+	// while the readers interleave, take one row and replay the winner's path. Once the winner wins again, take its run
+	// of rows before the runner-up, the best of the readers that lost on its path.
+	auto winner = winners[1];
+	auto previous = DConstants::INVALID_INDEX;
+	while (winner != DConstants::INVALID_INDEX && readers[winner].remaining > 0) {
+		auto &reader = readers[winner];
+		auto leaf = leaves + winner;
+		idx_t count = 1;
+		if (winner == previous) {
+			auto runner_up = DConstants::INVALID_INDEX;
+			for (auto node = leaf / 2; node >= 1; node /= 2) {
+				if (wins(tree[node], runner_up)) {
+					runner_up = tree[node];
+				}
+			}
+			if (runner_up == DConstants::INVALID_INDEX || readers[runner_up].remaining == 0) {
+				count = MinValue(reader.remaining, reader.Chunk().row_numbers.size() - reader.row);
+			} else {
+				auto inclusive = reader.range.input_idx < readers[runner_up].range.input_idx;
+				count = reader.RunBefore(readers[runner_up].Key(), inclusive);
+			}
+		}
+		output.Append(reader, count);
+		reader.Advance(count);
+		previous = winner;
+		for (auto node = leaf / 2; node >= 1; node /= 2) {
+			if (wins(tree[node], winner)) {
+				std::swap(tree[node], winner);
+			}
+		}
+	}
+}
+
+void DuckLakeSortedMergeSequencer::OrderBatch(const DuckLakeSequencedBatch &batch, vector<DuckLakeMergeSlice> &slices,
+                                              optional_ptr<DuckLakeMergeKeys> keys) {
 	slices.clear();
-	idx_t sequenced = 0;
-	while (sequenced < max_rows && (SectionActive() || StartNextSection())) {
-		auto &input = *merge_inputs[tree[0]];
-		DuckLakeMergeSlice slice {input.input_idx, input.row_numbers[input.position], 0, 0};
-		slice.has_keys = !input.keys.empty();
-		// the winner's current row comes first. While the inputs interleave, take one row and replay the winner's path;
-		// once the winner wins again, find the run of its rows before the runner-up.
-		bool won_again = false;
-		bool replayed = false;
-		while (true) {
-			auto end = MinValue(input.row_numbers.size(), input.position + max_rows - sequenced);
-			auto run_end = input.position + 1;
-			if (won_again) {
-				run_end = RunEnd(input, MinValue(input.position + 1, end), end, RunnerUp(input));
-			}
-			if (keys && slice.has_keys) {
-				if (key_owners[input.input_idx] != input.sort_keys.get()) {
-					key_owners[input.input_idx] = input.sort_keys.get();
-					keys->owners.push_back(input.sort_keys);
-				}
-				for (idx_t row = input.position; row < run_end; row++) {
-					keys->keys.push_back(input.keys[row].key);
+	if (keys) {
+		// the keys point into the sort keys of the batch's chunks
+		for (auto &part : batch.parts) {
+			for (auto &range : part) {
+				for (auto &chunk : range.chunks) {
+					if (chunk->sort_keys) {
+						keys->owners.push_back(chunk->sort_keys);
+					}
 				}
 			}
-			slice.row_end = input.row_numbers[run_end - 1] + 1;
-			slice.row_count += run_end - input.position;
-			sequenced += run_end - input.position;
-			input.position = run_end;
-			replayed = false;
-			if (input.position == input.row_numbers.size() &&
-			    (!LoadChunk(input) || input.keys.empty() == slice.has_keys)) {
-				// the input is exhausted, or a slice has the keys of all its rows or of none
-				RefreshKey(input);
-				break;
-			}
-			RefreshKey(input);
-			if (sequenced == max_rows) {
-				break;
-			}
-			Replay(input);
-			replayed = true;
-			if (tree[0] != input.input_idx) {
-				break;
-			}
-			won_again = true;
-		}
-		D_ASSERT(slice.row_count > 0);
-		slices.push_back(slice);
-		if (!replayed) {
-			Replay(input);
 		}
 	}
-	return !slices.empty();
+	BatchOutput output(slices, keys);
+	for (auto &part : batch.parts) {
+		if (part.size() == 1) {
+			output.AppendRange(part[0]);
+		} else if (part.size() > 1) {
+			MergeRanges(part, output);
+		}
+	}
 }
 
 } // namespace duckdb
