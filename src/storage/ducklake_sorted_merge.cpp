@@ -162,6 +162,26 @@ struct MergeKey {
 		return GreaterThan::Operation(other.key, key);
 	}
 
+	//! Negative, zero or positive as this key comes before, equals or comes after the other
+	int32_t Compare(const MergeKey &other) const {
+		if (high != other.high) {
+			return high < other.high ? -1 : 1;
+		}
+		if (low != other.low) {
+			return low < other.low ? -1 : 1;
+		}
+		if (PrefixIsKey(other)) {
+			return 0;
+		}
+		auto size = key.GetSize();
+		auto other_size = other.key.GetSize();
+		auto result = memcmp(key.GetData(), other.key.GetData(), MinValue(size, other_size));
+		if (result != 0) {
+			return result;
+		}
+		return size == other_size ? 0 : (size < other_size ? -1 : 1);
+	}
+
 	bool operator==(const MergeKey &other) const {
 		if (high != other.high || low != other.low) {
 			return false;
@@ -955,7 +975,6 @@ void DuckLakeSortedMergeSequencer::BatchInputRows(const DuckLakeSequencedBatch &
 struct RangeReader {
 	explicit RangeReader(const DuckLakeSequencedBatch::Range &range)
 	    : range(range), chunk(range.chunks[0].get()), chunk_idx(0), row(range.offset), remaining(range.row_count) {
-		CacheKey();
 	}
 
 	const DuckLakeSequencedBatch::Range &range;
@@ -964,16 +983,6 @@ struct RangeReader {
 	idx_t chunk_idx;
 	idx_t row;
 	idx_t remaining;
-	//! The leading words of the current key, so most comparisons do not leave the readers
-	uint64_t high = 0;
-	uint64_t low = 0;
-
-	void CacheKey() {
-		if (remaining > 0 && !Chunk().keys.empty()) {
-			high = Key().high;
-			low = Key().low;
-		}
-	}
 
 	const KeyChunk &Chunk() const {
 		return *chunk;
@@ -992,37 +1001,6 @@ struct RangeReader {
 			chunk = range.chunks[chunk_idx].get();
 			row = 0;
 		}
-		CacheKey();
-	}
-	//! The rows of the current chunk from the current row on that come before bound, at least one
-	idx_t RunBefore(const MergeKey &bound, bool inclusive) const {
-		auto &keys = Chunk().keys;
-		auto end = MinValue(row + remaining, keys.size());
-		auto before = [&](idx_t i) {
-			return keys[i] < bound || (inclusive && keys[i] == bound);
-		};
-		// gallop to bracket the first row that does not come before bound, then binary search
-		idx_t lo = row + 1;
-		idx_t hi = end;
-		idx_t step = 1;
-		while (lo < end) {
-			auto probe = MinValue(lo + step - 1, end - 1);
-			if (!before(probe)) {
-				hi = probe;
-				break;
-			}
-			lo = probe + 1;
-			step *= 2;
-		}
-		while (lo < hi) {
-			auto middle = lo + (hi - lo) / 2;
-			if (before(middle)) {
-				lo = middle + 1;
-			} else {
-				hi = middle;
-			}
-		}
-		return lo - row;
 	}
 };
 
@@ -1078,76 +1056,142 @@ struct BatchOutput {
 	}
 };
 
-//! Merges the ranges of a section with a loser tree: each node holds the reader that lost there, the root the winner
-static void MergeRanges(const vector<DuckLakeSequencedBatch::Range> &ranges, BatchOutput &output) {
+//! A row of a range to sort: the leading words of its key, its key, and its position in the stable merge order
+struct SortEntry {
+	uint64_t high;
+	uint64_t low;
+	const MergeKey *key;
+	uint32_t reader;
+	uint32_t order;
+
+	bool operator<(const SortEntry &other) const {
+		if (high != other.high) {
+			return high < other.high;
+		}
+		if (low != other.low) {
+			return low < other.low;
+		}
+		auto result = key->Compare(*other.key);
+		return result < 0 || (result == 0 && order < other.order);
+	}
+};
+
+//! The number of entries from first on that come before bound, found by galloping then binary search
+static idx_t RunBefore(const SortEntry *first, const SortEntry *last, const SortEntry &bound) {
+	idx_t count = NumericCast<idx_t>(last - first);
+	if (count == 0) {
+		return 0;
+	}
+	idx_t lo = 0;
+	idx_t hi = 1;
+	while (hi < count && first[hi - 1] < bound) {
+		lo = hi;
+		hi = MinValue(2 * hi + 1, count);
+	}
+	// first[lo - 1] comes before bound, the answer is in [lo, hi]
+	while (lo < hi) {
+		auto middle = lo + (hi - lo) / 2;
+		if (first[middle] < bound) {
+			lo = middle + 1;
+		} else {
+			hi = middle;
+		}
+	}
+	return lo;
+}
+
+//! Merges two runs into out. Once one run wins several times in a row, its rows that come before the other run's next
+//! row are found by galloping and copied together, like timsort.
+static void MergeRuns(const SortEntry *lhs, const SortEntry *lhs_end, const SortEntry *rhs, const SortEntry *rhs_end,
+                      SortEntry *out) {
+	static constexpr idx_t GALLOP_AFTER = 8;
+	idx_t lhs_wins = 0;
+	idx_t rhs_wins = 0;
+	while (lhs < lhs_end && rhs < rhs_end) {
+		if (*rhs < *lhs) {
+			*out++ = *rhs++;
+			rhs_wins++;
+			lhs_wins = 0;
+			if (rhs_wins >= GALLOP_AFTER) {
+				auto count = RunBefore(rhs, rhs_end, *lhs);
+				out = std::copy(rhs, rhs + count, out);
+				rhs += count;
+				rhs_wins = 0;
+			}
+		} else {
+			*out++ = *lhs++;
+			lhs_wins++;
+			rhs_wins = 0;
+			if (lhs_wins >= GALLOP_AFTER && rhs < rhs_end) {
+				auto count = RunBefore(lhs, lhs_end, *rhs);
+				out = std::copy(lhs, lhs + count, out);
+				lhs += count;
+				lhs_wins = 0;
+			}
+		}
+	}
+	out = std::copy(lhs, lhs_end, out);
+	std::copy(rhs, rhs_end, out);
+}
+
+//! Merges the ranges of a section by merging their rows pairwise in a flat array instead of with a loser tree
+static void SortRanges(const vector<DuckLakeSequencedBatch::Range> &ranges, vector<SortEntry> &entries,
+                       vector<SortEntry> &merged, BatchOutput &output) {
 	vector<RangeReader> readers;
-	for (auto &range : ranges) {
-		readers.emplace_back(range);
+	vector<idx_t> by_input;
+	for (idx_t i = 0; i < ranges.size(); i++) {
+		readers.emplace_back(ranges[i]);
+		by_input.push_back(i);
 	}
-	auto wins = [&](idx_t lhs, idx_t rhs) {
-		if (lhs == DConstants::INVALID_INDEX || readers[lhs].remaining == 0) {
-			return false;
+	// equal keys come from earlier inputs first, and in file order within an input
+	std::sort(by_input.begin(), by_input.end(),
+	          [&](idx_t lhs, idx_t rhs) { return ranges[lhs].input_idx < ranges[rhs].input_idx; });
+	entries.clear();
+	vector<idx_t> run_ends;
+	for (auto reader_idx : by_input) {
+		auto &range = ranges[reader_idx];
+		idx_t row = range.offset;
+		idx_t remaining = range.row_count;
+		for (idx_t chunk_idx = 0; remaining > 0; chunk_idx++) {
+			auto &keys = range.chunks[chunk_idx]->keys;
+			auto count = MinValue(remaining, keys.size() - row);
+			for (idx_t i = row; i < row + count; i++) {
+				auto &key = keys[i];
+				entries.push_back(SortEntry {key.high, key.low, &key, UnsafeNumericCast<uint32_t>(reader_idx),
+				                             UnsafeNumericCast<uint32_t>(entries.size())});
+			}
+			remaining -= count;
+			row = 0;
 		}
-		if (rhs == DConstants::INVALID_INDEX || readers[rhs].remaining == 0) {
-			return true;
-		}
-		auto &lhs_reader = readers[lhs];
-		auto &rhs_reader = readers[rhs];
-		if (lhs_reader.high != rhs_reader.high) {
-			return lhs_reader.high < rhs_reader.high;
-		}
-		if (lhs_reader.low != rhs_reader.low) {
-			return lhs_reader.low < rhs_reader.low;
-		}
-		auto &lhs_key = lhs_reader.Key();
-		auto &rhs_key = rhs_reader.Key();
-		return lhs_key < rhs_key || (readers[lhs].range.input_idx < readers[rhs].range.input_idx && lhs_key == rhs_key);
-	};
-	idx_t leaves = 1;
-	while (leaves < readers.size()) {
-		leaves *= 2;
+		run_ends.push_back(entries.size());
 	}
-	vector<idx_t> winners(2 * leaves, DConstants::INVALID_INDEX);
-	for (idx_t i = 0; i < readers.size(); i++) {
-		winners[leaves + i] = i;
+	// merge neighbouring runs into the other buffer until one run is left
+	merged.resize(entries.size());
+	while (run_ends.size() > 1) {
+		vector<idx_t> merged_ends;
+		idx_t start = 0;
+		for (idx_t i = 0; i < run_ends.size(); i += 2) {
+			auto middle = run_ends[i];
+			auto end = i + 1 < run_ends.size() ? run_ends[i + 1] : middle;
+			MergeRuns(entries.data() + start, entries.data() + middle, entries.data() + middle, entries.data() + end,
+			          merged.data() + start);
+			merged_ends.push_back(end);
+			start = end;
+		}
+		std::swap(entries, merged);
+		run_ends = std::move(merged_ends);
 	}
-	vector<idx_t> tree(leaves, DConstants::INVALID_INDEX);
-	for (idx_t node = leaves - 1; node >= 1; node--) {
-		auto lhs = winners[2 * node];
-		auto rhs = winners[2 * node + 1];
-		winners[node] = wins(rhs, lhs) ? rhs : lhs;
-		tree[node] = wins(rhs, lhs) ? lhs : rhs;
-	}
-	// while the readers interleave, take one row and replay the winner's path. Once the winner wins again, take its run
-	// of rows before the runner-up, the best of the readers that lost on its path.
-	auto winner = winners[1];
-	auto previous = DConstants::INVALID_INDEX;
-	while (winner != DConstants::INVALID_INDEX && readers[winner].remaining > 0) {
-		auto &reader = readers[winner];
-		auto leaf = leaves + winner;
+	// append the runs of rows of the same reader that stay in its current chunk
+	for (idx_t i = 0; i < entries.size();) {
+		auto &reader = readers[entries[i].reader];
+		auto in_chunk = reader.chunk->row_numbers.size() - reader.row;
 		idx_t count = 1;
-		if (winner == previous) {
-			auto runner_up = DConstants::INVALID_INDEX;
-			for (auto node = leaf / 2; node >= 1; node /= 2) {
-				if (wins(tree[node], runner_up)) {
-					runner_up = tree[node];
-				}
-			}
-			if (runner_up == DConstants::INVALID_INDEX || readers[runner_up].remaining == 0) {
-				count = MinValue(reader.remaining, reader.Chunk().row_numbers.size() - reader.row);
-			} else {
-				auto inclusive = reader.range.input_idx < readers[runner_up].range.input_idx;
-				count = reader.RunBefore(readers[runner_up].Key(), inclusive);
-			}
+		while (count < in_chunk && i + count < entries.size() && entries[i + count].reader == entries[i].reader) {
+			count++;
 		}
 		output.Append(reader, count);
 		reader.Advance(count);
-		previous = winner;
-		for (auto node = leaf / 2; node >= 1; node /= 2) {
-			if (wins(tree[node], winner)) {
-				std::swap(tree[node], winner);
-			}
-		}
+		i += count;
 	}
 }
 
@@ -1167,11 +1211,13 @@ void DuckLakeSortedMergeSequencer::OrderBatch(const DuckLakeSequencedBatch &batc
 		}
 	}
 	BatchOutput output(slices, keys);
+	vector<SortEntry> entries;
+	vector<SortEntry> merged;
 	for (auto &part : batch.parts) {
 		if (part.size() == 1) {
 			output.AppendRange(part[0]);
 		} else if (part.size() > 1) {
-			MergeRanges(part, output);
+			SortRanges(part, entries, merged, output);
 		}
 	}
 }
