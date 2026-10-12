@@ -93,8 +93,12 @@ struct DuckLakeMergeSlice {
 	idx_t row_start;
 	idx_t row_end;
 	idx_t row_count;
-	//! Whether the sequencer read the sort keys of the rows
-	bool has_keys = true;
+};
+
+//! The next row_count rows of one merge input in merged order, each input's rows following on from its previous run
+struct DuckLakeMergeRun {
+	uint32_t input_idx;
+	uint32_t row_count;
 };
 
 //! The sort keys of sequenced rows in merged order, sharing the sequencer's key data
@@ -146,8 +150,11 @@ public:
 	bool NextBatch(idx_t max_rows, DuckLakeSequencedBatch &batch);
 	//! Put the rows of a batch in merged order, without the lock that guards NextBatch. When keys is given, it receives
 	//! the sort keys of the rows in merged order.
-	static void OrderBatch(const DuckLakeSequencedBatch &batch, vector<DuckLakeMergeSlice> &slices,
+	static void OrderBatch(const DuckLakeSequencedBatch &batch, vector<DuckLakeMergeRun> &runs,
 	                       optional_ptr<DuckLakeMergeKeys> keys = nullptr);
+	//! The file rows of the runs of a batch in merged order
+	static void RunSlices(const DuckLakeSequencedBatch &batch, const vector<DuckLakeMergeRun> &runs,
+	                      vector<DuckLakeMergeSlice> &slices);
 	//! The rows of every input a batch reads, one slice per input
 	static void BatchInputRows(const DuckLakeSequencedBatch &batch, vector<DuckLakeMergeSlice> &input_rows);
 	//! Read about a batch's share of keys of each input ahead, for batches of batch_rows rows
@@ -201,6 +208,8 @@ private:
 	bool CatalogBounds(const map<idx_t, DuckLakeFileKeyStats> &file_stats, const vector<FieldIndex> &fields,
 	                   MergeInput &input);
 	//! Read only the row numbers of an input merged alone from now on
+	//! Sets each input's key prefix from the bounds of its section
+	void SetKeyPrefixes();
 	void MakeKeyless(MergeInput &input);
 	//! Start merging the inputs of the next section, returns false when every section is merged
 	bool StartNextSection();

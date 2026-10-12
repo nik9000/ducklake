@@ -157,6 +157,42 @@ SELECT count(*) FROM ((FROM merged_long_keys EXCEPT ALL FROM ducklake.long_keys)
 ----
 0
 
+# every key shares a long prefix, which comparisons skip: interleaved files, duplicates, keys of different lengths after
+# the prefix and a key that is only the prefix
+statement ok
+CREATE TABLE ducklake.hosts (host VARCHAR, id INTEGER)
+
+statement ok
+ALTER TABLE ducklake.hosts SET SORTED BY (host)
+
+loop i 0 3
+
+statement ok
+INSERT INTO ducklake.hosts
+SELECT CASE
+	WHEN r = 0 THEN 'us-east-1.datacenter.example.com/'
+	WHEN r % 5 = 0 THEN 'us-east-1.datacenter.example.com/' || ((r * 3 + {i}) % 50)
+	ELSE 'us-east-1.datacenter.example.com/' || lpad(((r * 7 + {i}) % 200)::VARCHAR, 3, '0') || repeat('x', r % 3)
+	END, {i} * 1000 + r
+FROM range(300) t(r)
+
+endloop
+
+statement ok
+CREATE TEMP TABLE merged_hosts AS FROM ducklake_sorted_merge('ducklake', 'hosts', row_group_size := 64)
+
+query I
+SELECT count(*) FROM (SELECT rowid, host FROM merged_hosts) m
+FULL OUTER JOIN (SELECT row_number() OVER (ORDER BY host) - 1 AS rowid, host FROM ducklake.hosts) e USING (rowid)
+WHERE m.host IS DISTINCT FROM e.host
+----
+0
+
+query I
+SELECT count(*) FROM ((FROM merged_hosts EXCEPT ALL FROM ducklake.hosts) UNION ALL (FROM ducklake.hosts EXCEPT ALL FROM merged_hosts))
+----
+0
+
 # multi-column key with DESC and NULLS FIRST
 statement ok
 CREATE TABLE ducklake.multi (a INTEGER, b VARCHAR, id INTEGER)
