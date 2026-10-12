@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include "duckdb/common/allocator.hpp"
 #include "duckdb/common/atomic.hpp"
 #include <condition_variable>
 #include "duckdb/common/multi_file/multi_file_reader.hpp"
@@ -63,13 +64,16 @@ private:
 
 //! Chooses how many workers of a sorted merge may emit batches at once, from the decoded size of the batches. The batch
 //! copy takes a quarter of the memory limit and each worker keeps about two batches in it: one it builds and one
-//! waiting to be written in order.
+//! waiting to be written in order. The workers' buffers for ordering and emitting batches take another quarter.
 class DuckLakeSortedMergeWorkerPolicy {
 public:
-	explicit DuckLakeSortedMergeWorkerPolicy(idx_t max_threads);
+	DuckLakeSortedMergeWorkerPolicy(idx_t max_threads, idx_t worker_bytes);
 
 	//! Record the decoded bytes of a full batch
 	void AddBatch(idx_t batch_bytes, idx_t max_memory);
+	//! Cap the workers to those that fit the merge's memory reservation: fixed_bytes for the merge and worker_bytes
+	//! for each worker. The reservation replaces the share of the memory limit for the workers' buffers.
+	void SetReservation(idx_t fixed_bytes, idx_t per_worker_bytes, idx_t reservation);
 	//! The workers allowed under the current memory limit
 	idx_t WorkerLimit(idx_t max_memory) const;
 	idx_t AverageBatchBytes() const {
@@ -81,6 +85,12 @@ private:
 
 private:
 	idx_t max_threads;
+	//! The buffers each worker uses to order and emit a batch
+	idx_t worker_bytes;
+	//! The merge's memory reservation, when one is made
+	idx_t reservation = 0;
+	idx_t reservation_fixed_bytes = 0;
+	idx_t reservation_worker_bytes = 0;
 	//! Follows wider batches at once and narrower batches slowly
 	idx_t average_batch_bytes = 0;
 	//! Drops at once and at most doubles per batch
@@ -101,12 +111,110 @@ struct DuckLakeMergeRun {
 	uint32_t row_count;
 };
 
+//! A growable array of trivially copyable values in memory from an allocator, which keeps its memory when cleared
+template <class T>
+class DuckLakeAllocatedArray {
+public:
+	explicit DuckLakeAllocatedArray(Allocator &allocator) : allocator(&allocator) {
+	}
+
+	idx_t size() const {
+		return count;
+	}
+	bool empty() const {
+		return count == 0;
+	}
+	T *data() {
+		return reinterpret_cast<T *>(buffer.get());
+	}
+	const T *data() const {
+		return reinterpret_cast<const T *>(buffer.get());
+	}
+	T &operator[](idx_t idx) {
+		return data()[idx];
+	}
+	const T &operator[](idx_t idx) const {
+		return data()[idx];
+	}
+	T &back() {
+		return data()[count - 1];
+	}
+	T *begin() {
+		return data();
+	}
+	T *end() {
+		return data() + count;
+	}
+	const T *begin() const {
+		return data();
+	}
+	const T *end() const {
+		return data() + count;
+	}
+	void push_back(const T &value) {
+		if (count == capacity) {
+			Grow(MaxValue<idx_t>(capacity * 2, MIN_CAPACITY));
+		}
+		data()[count++] = value;
+	}
+	//! Sets the size without initializing new values
+	void resize(idx_t new_count) {
+		if (new_count > capacity) {
+			Grow(new_count);
+		}
+		count = new_count;
+	}
+	void clear() {
+		count = 0;
+	}
+	//! Clears the array and gives its memory back to the allocator
+	void Release() {
+		buffer.Reset();
+		count = 0;
+		capacity = 0;
+	}
+	void Swap(DuckLakeAllocatedArray &other) {
+		std::swap(allocator, other.allocator);
+		std::swap(buffer, other.buffer);
+		std::swap(count, other.count);
+		std::swap(capacity, other.capacity);
+	}
+
+private:
+	static constexpr idx_t MIN_CAPACITY = 1024;
+
+	void Grow(idx_t new_capacity) {
+		auto new_buffer = allocator->Allocate(new_capacity * sizeof(T));
+		if (count > 0) {
+			memcpy(new_buffer.get(), buffer.get(), count * sizeof(T));
+		}
+		buffer = std::move(new_buffer);
+		capacity = new_capacity;
+	}
+
+	Allocator *allocator;
+	AllocatedData buffer;
+	idx_t count = 0;
+	idx_t capacity = 0;
+};
+
 //! The sort keys of sequenced rows in merged order, sharing the sequencer's key data
 struct DuckLakeMergeKeys {
-	vector<string_t> keys;
+	explicit DuckLakeMergeKeys(Allocator &allocator) : keys(allocator) {
+	}
+
+	DuckLakeAllocatedArray<string_t> keys;
 	//! Keep the key data alive
 	vector<shared_ptr<Vector>> owners;
+
+	void Clear() {
+		keys.clear();
+		owners.clear();
+	}
 };
+
+//! The buffers a worker orders the rows of a batch in
+struct DuckLakeOrderBuffers;
 
 struct DuckLakeSortedMergeKeyChunk;
 
@@ -150,10 +258,16 @@ public:
 	bool NextBatch(idx_t max_rows, DuckLakeSequencedBatch &batch);
 	//! Put the rows of a batch in merged order, without the lock that guards NextBatch. When keys is given, it receives
 	//! the sort keys of the rows in merged order.
-	static void OrderBatch(const DuckLakeSequencedBatch &batch, vector<DuckLakeMergeRun> &runs,
+	static void OrderBatch(const DuckLakeSequencedBatch &batch, DuckLakeOrderBuffers &buffers,
+	                       DuckLakeAllocatedArray<DuckLakeMergeRun> &runs,
 	                       optional_ptr<DuckLakeMergeKeys> keys = nullptr);
+	static shared_ptr<DuckLakeOrderBuffers> CreateOrderBuffers(Allocator &allocator);
+	//! Gives the memory of the buffers back to their allocator
+	static void ReleaseOrderBuffers(DuckLakeOrderBuffers &buffers);
+	//! The most memory a worker's buffers take to order and emit a batch of batch_rows rows
+	static idx_t WorkerBytes(idx_t batch_rows, bool with_keys);
 	//! The file rows of the runs of a batch in merged order
-	static void RunSlices(const DuckLakeSequencedBatch &batch, const vector<DuckLakeMergeRun> &runs,
+	static void RunSlices(const DuckLakeSequencedBatch &batch, const DuckLakeAllocatedArray<DuckLakeMergeRun> &runs,
 	                      vector<DuckLakeMergeSlice> &slices);
 	//! The rows of every input a batch reads, one slice per input
 	static void BatchInputRows(const DuckLakeSequencedBatch &batch, vector<DuckLakeMergeSlice> &input_rows);
@@ -196,6 +310,8 @@ public:
 	void SetMaxSegmentsAhead(idx_t max_segments) {
 		max_segments_ahead = max_segments;
 	}
+	//! The most segments of sort keys loaded at once, each with its own scanner
+	idx_t MaxSegmentsLoaded() const;
 
 private:
 	struct KeySegment;

@@ -50,10 +50,82 @@ SELECT batch, worker_limit FROM ducklake_sorted_merge_worker_limits('100GB', 4, 
 2	4
 3	4
 
+# the workers' buffers for ordering batches take a quarter of the memory limit too, which caps narrow batches
+query II
+SELECT batch, worker_limit
+FROM ducklake_sorted_merge_worker_limits('500MB', 24, [1500000, 1500000, 1500000, 1500000, 1500000], worker_bytes := 10813440)
+----
+0	2
+1	4
+2	8
+3	11
+4	11
+
+# with small worker buffers only the batch copy's share caps the workers
+query II
+SELECT batch, worker_limit
+FROM ducklake_sorted_merge_worker_limits('500MB', 24, [1500000, 1500000, 1500000, 1500000, 1500000], worker_bytes := 1)
+----
+0	2
+1	4
+2	8
+3	16
+4	24
+
+# the merge's memory reservation caps the workers to those whose bytes fit after the fixed bytes of the merge
+query II
+SELECT batch, worker_limit
+FROM ducklake_sorted_merge_worker_limits('8GB', 24, [1500000, 1500000, 1500000, 1500000, 1500000, 1500000],
+	fixed_bytes := 100000000, per_worker_bytes := 40000000,
+	reservations := [500000000, 500000000, 500000000, 500000000, 500000000, 500000000])
+----
+0	2
+1	4
+2	8
+3	10
+4	10
+5	10
+
+# a reservation below the fixed bytes still allows one worker
+query II
+SELECT batch, worker_limit
+FROM ducklake_sorted_merge_worker_limits('8GB', 24, [1500000, 1500000, 1500000],
+	fixed_bytes := 100000000, per_worker_bytes := 40000000, reservations := [90000000, 90000000, 90000000])
+----
+0	1
+1	1
+2	1
+
+# a smaller reservation drops the limit at once, a larger one raises it again by doubling
+query II
+SELECT batch, worker_limit
+FROM ducklake_sorted_merge_worker_limits('8GB', 24, [1500000, 1500000, 1500000, 1500000, 1500000, 1500000, 1500000, 1500000],
+	fixed_bytes := 100000000, per_worker_bytes := 40000000,
+	reservations := [900000000, 900000000, 900000000, 900000000, 260000000, 260000000, 900000000, 900000000])
+----
+0	2
+1	4
+2	8
+3	16
+4	4
+5	4
+6	4
+7	8
+
+statement error
+SELECT * FROM ducklake_sorted_merge_worker_limits('1GB', 4, [1000000, 1000000], reservations := [100000000])
+----
+reservations must have one entry per batch
+
 query I
 SELECT count(*) FROM ducklake_sorted_merge_worker_limits('1GB', 4, [])
 ----
 0
+
+statement error
+SELECT * FROM ducklake_sorted_merge_worker_limits('1GB', 4, [1000000], worker_bytes := 0)
+----
+worker_bytes must be positive
 
 statement error
 SELECT * FROM ducklake_sorted_merge_worker_limits('1GB', 0, [1000000])

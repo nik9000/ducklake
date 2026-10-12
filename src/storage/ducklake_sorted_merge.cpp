@@ -87,11 +87,13 @@ bool DuckLakeSingleFileScanner::Scan(DataChunk &chunk) {
 //! Batches a worker keeps in the batch copy, and the fraction of the memory limit the batch copy takes
 static constexpr idx_t BATCHES_PER_WORKER = 2;
 static constexpr idx_t WRITER_MEMORY_FRACTION = 4;
+static constexpr idx_t WORKER_MEMORY_FRACTION = 4;
 //! A narrower batch moves the average 1/BATCH_BYTES_DECAY of the way
 static constexpr idx_t BATCH_BYTES_DECAY = 12;
 
-DuckLakeSortedMergeWorkerPolicy::DuckLakeSortedMergeWorkerPolicy(idx_t max_threads)
-    : max_threads(MaxValue<idx_t>(max_threads, 1)) {
+DuckLakeSortedMergeWorkerPolicy::DuckLakeSortedMergeWorkerPolicy(idx_t max_threads, idx_t worker_bytes)
+    : max_threads(MaxValue<idx_t>(max_threads, 1)), worker_bytes(worker_bytes) {
+	D_ASSERT(worker_bytes > 0);
 }
 
 void DuckLakeSortedMergeWorkerPolicy::AddBatch(idx_t batch_bytes, idx_t max_memory) {
@@ -102,6 +104,12 @@ void DuckLakeSortedMergeWorkerPolicy::AddBatch(idx_t batch_bytes, idx_t max_memo
 	}
 	auto target = TargetWorkers(max_memory);
 	limit = target < limit ? target : MinValue(target, limit * 2);
+}
+
+void DuckLakeSortedMergeWorkerPolicy::SetReservation(idx_t fixed_bytes, idx_t per_worker_bytes, idx_t reservation_p) {
+	reservation_fixed_bytes = fixed_bytes;
+	reservation_worker_bytes = per_worker_bytes;
+	reservation = reservation_p;
 }
 
 idx_t DuckLakeSortedMergeWorkerPolicy::WorkerLimit(idx_t max_memory) const {
@@ -115,6 +123,12 @@ idx_t DuckLakeSortedMergeWorkerPolicy::WorkerLimit(idx_t max_memory) const {
 
 idx_t DuckLakeSortedMergeWorkerPolicy::TargetWorkers(idx_t max_memory) const {
 	auto workers = max_memory / (BATCHES_PER_WORKER * WRITER_MEMORY_FRACTION * MaxValue<idx_t>(average_batch_bytes, 1));
+	if (reservation > 0) {
+		auto spare = reservation > reservation_fixed_bytes ? reservation - reservation_fixed_bytes : 0;
+		workers = MinValue(workers, spare / MaxValue<idx_t>(reservation_worker_bytes, 1));
+	} else {
+		workers = MinValue(workers, max_memory / (WORKER_MEMORY_FRACTION * worker_bytes));
+	}
 	return MaxValue<idx_t>(1, MinValue(workers, max_threads));
 }
 
@@ -837,6 +851,12 @@ bool DuckLakeSortedMergeSequencer::StartSegment() {
 	return true;
 }
 
+idx_t DuckLakeSortedMergeSequencer::MaxSegmentsLoaded() const {
+	// the segment being merged and those loaded ahead of it, for every input
+	return MinValue<idx_t>(max_segments_ahead + merge_inputs.size(),
+	                       merge_inputs.size() * (MAX_INPUT_SEGMENTS_AHEAD + 1));
+}
+
 bool DuckLakeSortedMergeSequencer::MergingKeys() const {
 	if (!initialized) {
 		return true;
@@ -1058,10 +1078,11 @@ struct RangeReader {
 
 //! Appends rows to the runs and sort keys of a batch in merged order
 struct BatchOutput {
-	BatchOutput(vector<DuckLakeMergeRun> &runs, optional_ptr<DuckLakeMergeKeys> keys) : runs(runs), keys(keys) {
+	BatchOutput(DuckLakeAllocatedArray<DuckLakeMergeRun> &runs, optional_ptr<DuckLakeMergeKeys> keys)
+	    : runs(runs), keys(keys) {
 	}
 
-	vector<DuckLakeMergeRun> &runs;
+	DuckLakeAllocatedArray<DuckLakeMergeRun> &runs;
 	optional_ptr<DuckLakeMergeKeys> keys;
 
 	void AddRows(idx_t input_idx, idx_t count) {
@@ -1180,8 +1201,8 @@ static void MergeRuns(const SortEntry *lhs, const SortEntry *lhs_end, const Sort
 }
 
 //! Merges the ranges of a section by merging their rows pairwise in a flat array instead of with a loser tree
-static void SortRanges(const vector<DuckLakeSequencedBatch::Range> &ranges, vector<SortEntry> &entries,
-                       vector<SortEntry> &merged, BatchOutput &output) {
+static void SortRanges(const vector<DuckLakeSequencedBatch::Range> &ranges, DuckLakeAllocatedArray<SortEntry> &entries,
+                       DuckLakeAllocatedArray<SortEntry> &merged, BatchOutput &output) {
 	vector<RangeReader> readers;
 	vector<idx_t> by_input;
 	for (idx_t i = 0; i < ranges.size(); i++) {
@@ -1223,7 +1244,7 @@ static void SortRanges(const vector<DuckLakeSequencedBatch::Range> &ranges, vect
 			merged_ends.push_back(end);
 			start = end;
 		}
-		std::swap(entries, merged);
+		entries.Swap(merged);
 		run_ends = std::move(merged_ends);
 	}
 	// append the runs of rows of the same reader that stay in its current chunk
@@ -1240,7 +1261,8 @@ static void SortRanges(const vector<DuckLakeSequencedBatch::Range> &ranges, vect
 	}
 }
 
-void DuckLakeSortedMergeSequencer::RunSlices(const DuckLakeSequencedBatch &batch, const vector<DuckLakeMergeRun> &runs,
+void DuckLakeSortedMergeSequencer::RunSlices(const DuckLakeSequencedBatch &batch,
+                                             const DuckLakeAllocatedArray<DuckLakeMergeRun> &runs,
                                              vector<DuckLakeMergeSlice> &slices) {
 	// each input's rows, in the order of its ranges
 	map<idx_t, vector<idx_t>> input_rows;
@@ -1270,7 +1292,31 @@ void DuckLakeSortedMergeSequencer::RunSlices(const DuckLakeSequencedBatch &batch
 	}
 }
 
-void DuckLakeSortedMergeSequencer::OrderBatch(const DuckLakeSequencedBatch &batch, vector<DuckLakeMergeRun> &runs,
+struct DuckLakeOrderBuffers {
+	explicit DuckLakeOrderBuffers(Allocator &allocator) : entries(allocator), merged(allocator) {
+	}
+
+	DuckLakeAllocatedArray<SortEntry> entries;
+	DuckLakeAllocatedArray<SortEntry> merged;
+};
+
+shared_ptr<DuckLakeOrderBuffers> DuckLakeSortedMergeSequencer::CreateOrderBuffers(Allocator &allocator) {
+	return make_shared_ptr<DuckLakeOrderBuffers>(allocator);
+}
+
+void DuckLakeSortedMergeSequencer::ReleaseOrderBuffers(DuckLakeOrderBuffers &buffers) {
+	buffers.entries.Release();
+	buffers.merged.Release();
+}
+
+idx_t DuckLakeSortedMergeSequencer::WorkerBytes(idx_t batch_rows, bool with_keys) {
+	// two arrays of rows to merge, a run per row when the inputs alternate, and the sort key of each row
+	auto row_bytes = 2 * sizeof(SortEntry) + sizeof(DuckLakeMergeRun) + (with_keys ? sizeof(string_t) : 0);
+	return batch_rows * row_bytes;
+}
+
+void DuckLakeSortedMergeSequencer::OrderBatch(const DuckLakeSequencedBatch &batch, DuckLakeOrderBuffers &buffers,
+                                              DuckLakeAllocatedArray<DuckLakeMergeRun> &runs,
                                               optional_ptr<DuckLakeMergeKeys> keys) {
 	runs.clear();
 	if (keys) {
@@ -1286,8 +1332,8 @@ void DuckLakeSortedMergeSequencer::OrderBatch(const DuckLakeSequencedBatch &batc
 		}
 	}
 	BatchOutput output(runs, keys);
-	vector<SortEntry> entries;
-	vector<SortEntry> merged;
+	auto &entries = buffers.entries;
+	auto &merged = buffers.merged;
 	for (auto &part : batch.parts) {
 		if (part.size() == 1) {
 			output.AppendRange(part[0]);

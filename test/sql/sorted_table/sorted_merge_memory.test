@@ -1,0 +1,84 @@
+# name: test/sql/sorted_table/sorted_merge_memory.test
+# description: a sorted merge reserves its memory and fits wide rows of many files under a small memory limit
+# group: [sorted_table]
+
+require ducklake
+
+require parquet
+
+test-env DUCKLAKE_CONNECTION {TEST_DIR}/{UUID}.db
+
+statement ok
+ATTACH 'ducklake:{DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '{TEST_DIR}/sorted_merge_memory/', DATA_INLINING_ROW_LIMIT 0)
+
+statement ok
+CALL ducklake.set_option('parquet_row_group_size', 16384)
+
+statement ok
+CREATE TABLE ducklake.wide (k BIGINT, a VARCHAR, b VARCHAR)
+
+statement ok
+ALTER TABLE ducklake.wide SET SORTED BY (k)
+
+loop i 0 8
+
+statement ok
+INSERT INTO ducklake.wide
+SELECT hash(r, {i}) % 1000000, md5((r * {i})::VARCHAR) || md5(r::VARCHAR), md5((r + {i})::VARCHAR)
+FROM range(60000) t(r)
+
+endloop
+
+statement ok
+SET threads = 8
+
+# without a temporary directory nothing can be offloaded, so the reservation is the whole request
+statement ok
+SET temp_directory = ''
+
+statement ok
+SET memory_limit = '2GB'
+
+statement ok
+CREATE TEMP TABLE merged_in_memory AS FROM ducklake_sorted_merge('ducklake', 'wide', row_group_size := 16384)
+
+query I
+SELECT count(*) FROM (SELECT rowid, k FROM merged_in_memory) m
+FULL OUTER JOIN (SELECT row_number() OVER (ORDER BY k) - 1 AS rowid, k FROM ducklake.wide) e USING (rowid)
+WHERE m.k IS DISTINCT FROM e.k
+----
+0
+
+statement ok
+DROP TABLE merged_in_memory
+
+statement ok
+SET memory_limit = '120MB'
+
+statement ok
+SET temp_directory = '{TEST_DIR}/sorted_merge_memory_spill'
+
+statement ok
+CREATE TEMP TABLE merged AS FROM ducklake_sorted_merge('ducklake', 'wide', row_group_size := 16384)
+
+# the reservation is shown with the merge
+query II
+EXPLAIN ANALYZE COPY (FROM ducklake_sorted_merge('ducklake', 'wide', row_group_size := 16384)) TO '{TEST_DIR}/sorted_merge_memory.parquet'
+----
+analyzed_plan	<REGEX>:.*Memory Reservation.*
+
+# check the merged rows with room to compare them
+statement ok
+SET memory_limit = '2GB'
+
+query I
+SELECT count(*) FROM (SELECT rowid, k FROM merged) m
+FULL OUTER JOIN (SELECT row_number() OVER (ORDER BY k) - 1 AS rowid, k FROM ducklake.wide) e USING (rowid)
+WHERE m.k IS DISTINCT FROM e.k
+----
+0
+
+query I
+SELECT count(*) FROM ((FROM merged EXCEPT ALL FROM ducklake.wide) UNION ALL (FROM ducklake.wide EXCEPT ALL FROM merged))
+----
+0

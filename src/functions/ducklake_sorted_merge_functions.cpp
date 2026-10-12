@@ -11,6 +11,7 @@
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/planner/operator/logical_extension_operator.hpp"
 #include "duckdb/storage/buffer_manager.hpp"
+#include "duckdb/storage/temporary_memory_manager.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
 #include "storage/ducklake_catalog.hpp"
 #include "storage/ducklake_multi_file_reader.hpp"
@@ -116,11 +117,13 @@ static unique_ptr<FunctionData> DuckLakeSortedMergeSequenceBind(ClientContext &c
 	auto inputs = BindMergeInputs(context, table, files);
 	DuckLakeSortedMergeSequencer sequencer(context, table, inputs, row_group_size * ROW_GROUPS_PER_KEY_SEGMENT);
 	auto result = make_uniq<MetadataBindData>();
-	vector<DuckLakeMergeRun> runs;
+	auto &allocator = Allocator::DefaultAllocator();
+	auto buffers = DuckLakeSortedMergeSequencer::CreateOrderBuffers(allocator);
+	DuckLakeAllocatedArray<DuckLakeMergeRun> runs(allocator);
 	vector<DuckLakeMergeSlice> slices;
 	DuckLakeSequencedBatch batch;
 	for (idx_t row_group = 0; sequencer.NextBatch(row_group_size, batch); row_group++) {
-		DuckLakeSortedMergeSequencer::OrderBatch(batch, runs);
+		DuckLakeSortedMergeSequencer::OrderBatch(batch, *buffers, runs);
 		DuckLakeSortedMergeSequencer::RunSlices(batch, runs, slices);
 		if (summary) {
 			set<idx_t> touched_inputs;
@@ -186,16 +189,35 @@ struct SortedMergeSegmentReader {
 	SortedMergeSegmentReader(idx_t row_start, idx_t row_end) : row_end(row_end), next_unit_start(row_start) {
 	}
 
+	~SortedMergeSegmentReader() {
+		CloseScanner();
+	}
+
 	mutex lock;
 	//! One past the last file row of the segment
 	idx_t row_end;
+	//! The scanner, while the segment is being decoded, and the count of open scanners it is in
 	unique_ptr<DuckLakeSingleFileScanner> scanner;
+	optional_ptr<atomic<idx_t>> open_scanners;
 	DataChunk scan_chunk;
 	bool exhausted = false;
 	//! The first file row of the next unit
 	idx_t next_unit_start;
 	//! Decoded units that a batch may still need
 	deque<shared_ptr<SortedMergeDecodeUnit>> units;
+
+	void OpenScanner(unique_ptr<DuckLakeSingleFileScanner> scanner_p, atomic<idx_t> &open_scanners_p) {
+		scanner = std::move(scanner_p);
+		open_scanners = &open_scanners_p;
+		(*open_scanners)++;
+	}
+	//! The scanner holds the file's buffers, which the segment no longer needs once it is decoded
+	void CloseScanner() {
+		if (scanner) {
+			scanner.reset();
+			(*open_scanners)--;
+		}
+	}
 };
 
 //! The segments of one input, each read by its own reader so different parts of a file decode in parallel
@@ -211,6 +233,15 @@ struct SortedMergeInputReader {
 
 //! The inherited lock guards the batch counts and the parked workers
 struct SortedMergeGlobalState : public GlobalSourceState {
+	~SortedMergeGlobalState() override {
+		// every segment closes its scanner
+		readers.clear();
+		D_ASSERT(open_payload_scanners == 0);
+	}
+
+	//! Segments of payload with an open scanner, and how many the memory reservation allows decoding ahead to keep open
+	atomic<idx_t> open_payload_scanners {0};
+	atomic<idx_t> max_payload_scanners_ahead {0};
 	//! Guards the sequencer
 	mutex sequence_lock;
 	vector<unique_ptr<DuckLakeFileScanBind>> inputs;
@@ -225,6 +256,21 @@ struct SortedMergeGlobalState : public GlobalSourceState {
 	idx_t batches_in_flight = 0;
 	//! Workers allowed from the decoded size of the batches, as the sink measures it
 	unique_ptr<DuckLakeSortedMergeWorkerPolicy> worker_policy;
+	//! The memory of the merge itself, reserved once the first batch is measured: the decode units and key scanners
+	//! of the merge, and the buffers and payload scanner of each worker
+	unique_ptr<TemporaryMemoryState> memory_state;
+	idx_t reserved_fixed_bytes = 0;
+	idx_t reserved_worker_bytes = 0;
+	//! The bytes per worker for ordering and emitting a batch
+	idx_t worker_bytes = 0;
+	//! The compressed bytes of a row group of the inputs, and the share of them the sort key columns take
+	idx_t compressed_row_group_bytes = 0;
+	//! The share of the decoded bytes of the batches the sort key columns take
+	idx_t decoded_bytes = 0;
+	idx_t decoded_key_bytes = 0;
+	double key_column_share = 0;
+	//! Whether columns other than the sort keys are read from the files
+	bool has_payload = false;
 	bool sequencer_exhausted = false;
 	//! For logging and EXPLAIN ANALYZE
 	idx_t worker_limit = 0;
@@ -276,7 +322,8 @@ struct SortedMergeInputCursor {
 };
 
 struct SortedMergeLocalState : public LocalSourceState {
-	explicit SortedMergeLocalState(SortedMergeGlobalState &gstate) : gstate(gstate) {
+	SortedMergeLocalState(SortedMergeGlobalState &gstate, Allocator &allocator)
+	    : gstate(gstate), runs(allocator), order_buffers(DuckLakeSortedMergeSequencer::CreateOrderBuffers(allocator)) {
 	}
 	//! A worker that stops inside a batch, e.g. when a LIMIT is reached, gives its slot back to the parked workers
 	~SortedMergeLocalState() override;
@@ -286,15 +333,29 @@ struct SortedMergeLocalState : public LocalSourceState {
 	bool has_batch = false;
 	//! Decoded bytes of the rows emitted for the current batch
 	idx_t batch_bytes = 0;
+	//! The part of batch_bytes the sort key columns take
+	idx_t batch_key_bytes = 0;
 	//! The rows the sequencer chose for the batch, the rows of each input, and the rows in merged order
 	DuckLakeSequencedBatch sequenced;
 	vector<DuckLakeMergeSlice> input_rows;
-	vector<DuckLakeMergeRun> runs;
+	DuckLakeAllocatedArray<DuckLakeMergeRun> runs;
 	idx_t run_idx = 0;
 	idx_t run_offset = 0;
+	//! The buffers the batch is ordered in, kept for the next batch
+	shared_ptr<DuckLakeOrderBuffers> order_buffers;
 	//! A cursor per input, and the inputs the current batch reads in the order it first reads them
 	vector<unique_ptr<SortedMergeInputCursor>> cursors;
 	vector<idx_t> batch_inputs;
+
+	//! A parked worker gives back the memory of its buffers
+	void ReleaseBuffers() {
+		runs.Release();
+		DuckLakeSortedMergeSequencer::ReleaseOrderBuffers(*order_buffers);
+		if (batch_keys) {
+			batch_keys->Clear();
+			batch_keys->keys.Release();
+		}
+	}
 
 	void ResetCursors() {
 		for (auto input_idx : batch_inputs) {
@@ -344,7 +405,22 @@ static unique_ptr<SortedMergeGlobalState> InitSortedMergeGlobal(ClientContext &c
 	auto input_count = result->inputs.size();
 	auto keys_only = result->sequencer->DecodableColumns().size() == bind_data.table.GetColumns().PhysicalColumnCount();
 	auto segments_ahead = max_memory / (keys_only ? KEY_SEGMENT_MEMORY / 2 : KEY_SEGMENT_MEMORY);
+
+	result->has_payload = !keys_only || bind_data.write_snapshot_id;
 	result->sequencer->SetMaxSegmentsAhead(segments_ahead < 2 * input_count ? input_count : segments_ahead);
+	idx_t file_bytes = 0;
+	idx_t file_rows = 0;
+	for (auto &input : result->inputs) {
+		if (input->row_count.IsValid()) {
+			file_bytes += input->file.file.file_size_bytes;
+			file_rows += input->row_count.GetIndex();
+		}
+	}
+	if (file_rows > 0) {
+		result->compressed_row_group_bytes = file_bytes * bind_data.row_group_size / file_rows;
+	}
+	result->key_column_share = double(MaxValue<idx_t>(result->sequencer->DecodableColumns().size(), 1)) /
+	                           double(bind_data.table.GetColumns().PhysicalColumnCount());
 	for (idx_t input_idx = 0; input_idx < result->inputs.size(); input_idx++) {
 		result->readers.push_back(make_uniq<SortedMergeInputReader>());
 	}
@@ -357,13 +433,18 @@ static unique_ptr<SortedMergeGlobalState> InitSortedMergeGlobal(ClientContext &c
 	result->decode_ahead = result->unit_size_bytes * input_count <= max_memory / UNIT_MEMORY_FRACTION;
 	result->segment_size = bind_data.row_group_size;
 	result->max_threads = TaskScheduler::GetScheduler(context).NumberOfThreads();
-	result->worker_policy = make_uniq<DuckLakeSortedMergeWorkerPolicy>(result->max_threads);
+	auto worker_bytes = DuckLakeSortedMergeSequencer::WorkerBytes(bind_data.row_group_size,
+	                                                              !result->sequencer->DecodableColumns().empty());
+	result->worker_bytes = worker_bytes;
+	result->worker_policy = make_uniq<DuckLakeSortedMergeWorkerPolicy>(result->max_threads, worker_bytes);
 	return std::move(result);
 }
 
-static unique_ptr<SortedMergeLocalState> InitSortedMergeLocal(const SortedMergeBindData &bind_data,
-                                                              SortedMergeGlobalState &gstate) {
-	auto result = make_uniq<SortedMergeLocalState>(gstate);
+static unique_ptr<SortedMergeLocalState>
+InitSortedMergeLocal(ClientContext &context, const SortedMergeBindData &bind_data, SortedMergeGlobalState &gstate) {
+	// the buffers that grow with the batch count against the memory limit
+	auto &allocator = BufferAllocator::Get(context);
+	auto result = make_uniq<SortedMergeLocalState>(gstate, allocator);
 	for (idx_t input_idx = 0; input_idx < gstate.inputs.size(); input_idx++) {
 		result->cursors.push_back(make_uniq<SortedMergeInputCursor>());
 	}
@@ -395,6 +476,7 @@ static unique_ptr<SortedMergeLocalState> InitSortedMergeLocal(const SortedMergeB
 		result->staging.Initialize(Allocator::DefaultAllocator(), result->payload_types);
 	}
 	if (!key_types.empty()) {
+		result->batch_keys = make_uniq<DuckLakeMergeKeys>(allocator);
 		result->key_modifiers = gstate.sequencer->Modifiers();
 		result->decoded_keys.Initialize(Allocator::DefaultAllocator(), key_types);
 	}
@@ -415,8 +497,9 @@ static void DecodeNextUnit(ClientContext &context, const SortedMergeBindData &bi
 		filters->PushFilter(row_number_column,
 		                    ExpressionFilter::CreateComparisonFilter(
 		                        ExpressionType::COMPARE_LESSTHAN, Value::BIGINT(NumericCast<int64_t>(reader.row_end))));
-		reader.scanner = make_uniq<DuckLakeSingleFileScanner>(context, bind_data.table, *gstate.inputs[input_idx],
-		                                                      column_ids, std::move(filters));
+		reader.OpenScanner(make_uniq<DuckLakeSingleFileScanner>(context, bind_data.table, *gstate.inputs[input_idx],
+		                                                        column_ids, std::move(filters)),
+		                   gstate.open_payload_scanners);
 		reader.scan_chunk.Initialize(context, reader.scanner->GetTypes());
 	}
 	auto unit = make_shared_ptr<SortedMergeDecodeUnit>();
@@ -428,8 +511,7 @@ static void DecodeNextUnit(ClientContext &context, const SortedMergeBindData &bi
 	while (unit->rows->SizeInBytes() < gstate.unit_size_bytes) {
 		if (!reader.scanner->Scan(reader.scan_chunk)) {
 			reader.exhausted = true;
-			// the scanner holds the file's buffers, which the segment no longer needs
-			reader.scanner.reset();
+			reader.CloseScanner();
 			break;
 		}
 		payload.ReferenceColumns(reader.scan_chunk, lstate.payload_columns);
@@ -440,7 +522,7 @@ static void DecodeNextUnit(ClientContext &context, const SortedMergeBindData &bi
 		if (unit->row_numbers.back() + 1 == reader.row_end) {
 			// the last row of the segment is decoded, release the scanner without another scan
 			reader.exhausted = true;
-			reader.scanner.reset();
+			reader.CloseScanner();
 			break;
 		}
 	}
@@ -561,6 +643,10 @@ static bool DecodeAhead(ClientContext &context, const SortedMergeBindData &bind_
 		if (!reader_guard.owns_lock() || reader->exhausted || reader->next_unit_start > next_row) {
 			continue;
 		}
+		if (!reader->scanner && gstate.open_payload_scanners >= gstate.max_payload_scanners_ahead) {
+			// another open scanner would take more memory than the reservation allows
+			continue;
+		}
 		DecodeNextUnit(context, bind_data, gstate, lstate, input_idx, *reader);
 		gstate.units_decoded_ahead++;
 		return true;
@@ -611,7 +697,9 @@ static SortedMergeBatchResult LoadSortedMergeBatch(ClientContext &context, const
 		if (gstate.batches_in_flight >= worker_limit && input.interrupt_state.CanCallback()) {
 			// park at the batch boundary. First report the next batch index the sequencer hands out, so the sink takes
 			// the finished batch and moves on: every batch below it is done or being emitted by a running worker. The
-			// pipeline calls back right after taking the new index, and that call parks.
+			// pipeline calls back right after taking the new index, and that call parks. A worker without a batch gives
+			// back the memory of its buffers meanwhile.
+			lstate.ReleaseBuffers();
 			auto floor = gstate.next_batch_index.load();
 			if (gstate.requires_batch_index && floor > lstate.batch_index) {
 				lstate.batch_index = floor;
@@ -659,9 +747,8 @@ static SortedMergeBatchResult LoadSortedMergeBatch(ClientContext &context, const
 			}
 			guard.try_lock();
 		}
-		if (!lstate.key_output_columns.empty()) {
-			lstate.batch_keys = make_uniq<DuckLakeMergeKeys>();
-			lstate.batch_keys->keys.reserve(bind_data.row_group_size);
+		if (lstate.batch_keys) {
+			lstate.batch_keys->Clear();
 			lstate.key_offset = 0;
 		}
 		if (!gstate.sequencer->NextBatch(bind_data.row_group_size, lstate.sequenced)) {
@@ -699,7 +786,8 @@ static SortedMergeBatchResult LoadSortedMergeBatch(ClientContext &context, const
 	gstate.sequencer->NotifyWaiters(true);
 	WakeParkedWorkers(gstate);
 	// put the batch's rows in merged order
-	DuckLakeSortedMergeSequencer::OrderBatch(lstate.sequenced, lstate.runs, lstate.batch_keys.get());
+	DuckLakeSortedMergeSequencer::OrderBatch(lstate.sequenced, *lstate.order_buffers, lstate.runs,
+	                                         lstate.batch_keys.get());
 	lstate.sequenced.Clear();
 	// take units in the order the batch first reads from each input
 	if (!lstate.batch_inputs.empty()) {
@@ -718,8 +806,59 @@ static SortedMergeBatchResult LoadSortedMergeBatch(ClientContext &context, const
 	lstate.run_idx = 0;
 	lstate.run_offset = 0;
 	lstate.batch_bytes = 0;
+	lstate.batch_key_bytes = 0;
 	lstate.has_batch = true;
 	return SortedMergeBatchResult::LOADED;
+}
+
+//! A scanner holds a row group of its columns as read and decompressed, and the file cache keeps the bytes read
+static idx_t ScannerBytes(idx_t decoded_bytes, double compression_ratio) {
+	return decoded_bytes + idx_t(2 * compression_ratio * double(decoded_bytes));
+}
+
+//! Reserve the merge's own memory with the temporary memory manager, and cap the workers to what it grants. Called at
+//! the end of every batch, which also sees other operators change their reservations. The caller holds the lock of
+//! the global state.
+static void UpdateMergeReservation(ClientContext &context, SortedMergeGlobalState &gstate) {
+	// the decoded bytes of a batch, and how much the inputs compress them, assuming the columns compress alike
+	auto batch_bytes = gstate.worker_policy->AverageBatchBytes();
+	auto compression_ratio =
+	    gstate.compressed_row_group_bytes > 0 ? double(gstate.compressed_row_group_bytes) / double(batch_bytes) : 1.0;
+	auto key_share = gstate.decoded_key_bytes > 0 ? double(gstate.decoded_key_bytes) / double(gstate.decoded_bytes)
+	                                              : gstate.key_column_share;
+	auto key_bytes = idx_t(key_share * double(batch_bytes));
+	idx_t fixed_bytes = gstate.sequencer->MaxSegmentsLoaded() * ScannerBytes(key_bytes, compression_ratio);
+	idx_t per_worker = gstate.worker_bytes;
+	idx_t payload_scanner = 0;
+	if (gstate.has_payload) {
+		// a unit in use and one decoding for every input
+		fixed_bytes += 2 * gstate.inputs.size() * gstate.unit_size_bytes;
+		// a worker decodes one segment of payload at a time
+		payload_scanner = ScannerBytes(batch_bytes - MinValue(key_bytes, batch_bytes), compression_ratio);
+		per_worker += payload_scanner;
+	}
+	if (!gstate.memory_state) {
+		gstate.memory_state = TemporaryMemoryManager::Get(context).Register(context);
+	}
+	if (fixed_bytes != gstate.reserved_fixed_bytes || per_worker != gstate.reserved_worker_bytes) {
+		gstate.memory_state->SetMinimumReservation(fixed_bytes + per_worker);
+		gstate.memory_state->SetRemainingSizeAndUpdateReservation(context,
+		                                                          fixed_bytes + gstate.max_threads * per_worker);
+		gstate.reserved_fixed_bytes = fixed_bytes;
+		gstate.reserved_worker_bytes = per_worker;
+		DUCKDB_LOG_DEBUG(context, StringUtil::Format("DuckLake sorted merge: reserved %llu bytes of %llu + %llu x %llu",
+		                                             gstate.memory_state->GetReservation(), fixed_bytes,
+		                                             gstate.max_threads, per_worker));
+	} else {
+		gstate.memory_state->UpdateReservation(context);
+	}
+	auto reservation = gstate.memory_state->GetReservation();
+	gstate.worker_policy->SetReservation(fixed_bytes, per_worker, reservation);
+	// decoding ahead may keep open the scanners of the workers, and of what the reservation has left over
+	auto workers = gstate.worker_policy->WorkerLimit(BufferManager::GetBufferManager(context).GetMaxMemory());
+	auto used = fixed_bytes + workers * per_worker;
+	auto spare_scanners = payload_scanner > 0 && reservation > used ? (reservation - used) / payload_scanner : 0;
+	gstate.max_payload_scanners_ahead = workers + spare_scanners;
 }
 
 static void FinishSortedMergeBatch(ExecutionContext &context, const PhysicalOperator &op,
@@ -731,7 +870,9 @@ static void FinishSortedMergeBatch(ExecutionContext &context, const PhysicalOper
 	}
 	// release the decode units and sort keys of the batch
 	lstate.ResetCursors();
-	lstate.batch_keys.reset();
+	if (lstate.batch_keys) {
+		lstate.batch_keys->Clear();
+	}
 	lstate.has_batch = false;
 	{
 		annotated_lock_guard<annotated_mutex> guard(gstate.lock);
@@ -740,6 +881,11 @@ static void FinishSortedMergeBatch(ExecutionContext &context, const PhysicalOper
 		if (batch_rows >= bind_data.row_group_size) {
 			gstate.worker_policy->AddBatch(lstate.batch_bytes,
 			                               BufferManager::GetBufferManager(context.client).GetMaxMemory());
+			gstate.decoded_bytes += lstate.batch_bytes;
+			gstate.decoded_key_bytes += lstate.batch_key_bytes;
+		}
+		if (gstate.worker_policy->AverageBatchBytes() > 0) {
+			UpdateMergeReservation(context.client, gstate);
 		}
 		if (QueryProfiler::Get(context.client).IsEnabled()) {
 			// the profiler keeps the extra info of the thread that flushes last, so write the merge-wide numbers
@@ -759,6 +905,11 @@ static void FinishSortedMergeBatch(ExecutionContext &context, const PhysicalOper
 			info["Sections"] = to_string(gstate.sequencer->SectionCount());
 			info["Sections Merged Without Keys"] = to_string(gstate.sequencer->KeylessSectionCount());
 			info["Decode Unit Bytes"] = to_string(gstate.unit_size_bytes);
+			if (gstate.memory_state) {
+				info["Memory Reservation"] =
+				    to_string(gstate.memory_state->GetReservation()) + " of " + to_string(gstate.reserved_fixed_bytes) +
+				    " + " + to_string(gstate.max_threads) + " x " + to_string(gstate.reserved_worker_bytes);
+			}
 			auto &metrics = context.thread.profiler.GetOperatorMetrics(op);
 			metrics.name = op.GetName();
 			metrics.SetExtraInfo(std::move(info));
@@ -767,22 +918,27 @@ static void FinishSortedMergeBatch(ExecutionContext &context, const PhysicalOper
 	WakeParkedWorkers(gstate);
 }
 
-//! The bytes the sink's collection takes for these rows: the fixed-size values and the strings stored out of line
+//! The bytes the sink's collection takes for rows of a column: the fixed-size values and the strings stored out of line
+static idx_t SinkBytes(const Vector &vector, idx_t start, idx_t end) {
+	auto physical_type = vector.GetType().InternalType();
+	idx_t result = GetTypeIdSize(physical_type) * (end - start);
+	if (physical_type != PhysicalType::VARCHAR) {
+		return result;
+	}
+	auto values = vector.Values<string_t>();
+	for (idx_t row = start; row < end; row++) {
+		auto entry = values[row];
+		if (entry.IsValid() && !entry.GetValueUnsafe().IsInlined()) {
+			result += entry.GetValueUnsafe().GetSize();
+		}
+	}
+	return result;
+}
+
 static idx_t SinkBytes(const DataChunk &chunk, idx_t start) {
 	idx_t result = 0;
 	for (auto &vector : chunk.data) {
-		auto physical_type = vector.GetType().InternalType();
-		result += GetTypeIdSize(physical_type) * (chunk.size() - start);
-		if (physical_type != PhysicalType::VARCHAR) {
-			continue;
-		}
-		auto values = vector.Values<string_t>();
-		for (idx_t row = start; row < chunk.size(); row++) {
-			auto entry = values[row];
-			if (entry.IsValid() && !entry.GetValueUnsafe().IsInlined()) {
-				result += entry.GetValueUnsafe().GetSize();
-			}
-		}
+		result += SinkBytes(vector, start, chunk.size());
 	}
 	return result;
 }
@@ -905,6 +1061,9 @@ static void EmitSortedMergeRows(SortedMergeLocalState &lstate, DataChunk &output
 	}
 	output.SetCardinality(output_count);
 	lstate.batch_bytes += SinkBytes(output, 0);
+	for (auto column_idx : lstate.key_output_columns) {
+		lstate.batch_key_bytes += SinkBytes(output.data[column_idx], 0, output_count);
+	}
 }
 
 //===--------------------------------------------------------------------===//
@@ -942,7 +1101,7 @@ public:
 
 	unique_ptr<LocalSourceState> GetLocalSourceState(ExecutionContext &context,
 	                                                 GlobalSourceState &gstate) const override {
-		return InitSortedMergeLocal(*bind_data, gstate.Cast<SortedMergeGlobalState>());
+		return InitSortedMergeLocal(context.client, *bind_data, gstate.Cast<SortedMergeGlobalState>());
 	}
 
 	OperatorPartitionData GetPartitionData(ExecutionContext &context, DataChunk &chunk, GlobalSourceState &gstate,
@@ -1151,15 +1310,47 @@ static unique_ptr<FunctionData> DuckLakeSortedMergeWorkerLimitsBind(ClientContex
 	names.emplace_back("worker_limit");
 	return_types.emplace_back(LogicalType::BIGINT);
 
-	DuckLakeSortedMergeWorkerPolicy policy(NumericCast<idx_t>(threads));
+	auto get_bytes = [&](const char *name, idx_t default_value, bool allow_zero = false) {
+		Value value;
+		if (!DuckLakeTableFunctionUtil::TryGetNonNullOption(input, name, "integer", value)) {
+			return default_value;
+		}
+		auto bytes = value.GetValue<int64_t>();
+		if (bytes < 0 || (bytes == 0 && !allow_zero)) {
+			throw BinderException("%s must be %s", name, allow_zero ? "non-negative" : "positive");
+		}
+		return NumericCast<idx_t>(bytes);
+	};
+	auto worker_bytes =
+	    get_bytes("worker_bytes", DuckLakeSortedMergeSequencer::WorkerBytes(DEFAULT_ROW_GROUP_SIZE, true));
+	// the merge's memory reservation after each batch, for the fixed bytes of the merge and the bytes of each worker
+	auto fixed_bytes = get_bytes("fixed_bytes", 0, true);
+	auto per_worker_bytes = get_bytes("per_worker_bytes", worker_bytes);
+	vector<Value> reservations;
+	Value reservations_value;
+	if (DuckLakeTableFunctionUtil::TryGetNonNullOption(input, "reservations", "list", reservations_value)) {
+		reservations = ListValue::GetChildren(reservations_value);
+	}
+	auto &batches = ListValue::GetChildren(input.inputs[2]);
+	if (!reservations.empty() && reservations.size() != batches.size()) {
+		throw BinderException("reservations must have one entry per batch");
+	}
+	DuckLakeSortedMergeWorkerPolicy policy(NumericCast<idx_t>(threads), worker_bytes);
 	auto result = make_uniq<MetadataBindData>();
 	idx_t batch = 0;
-	for (auto &entry : ListValue::GetChildren(input.inputs[2])) {
+	for (auto &entry : batches) {
 		auto batch_bytes = entry.GetValue<int64_t>();
 		if (batch_bytes < 0) {
 			throw BinderException("batch sizes must not be negative");
 		}
 		policy.AddBatch(NumericCast<idx_t>(batch_bytes), max_memory);
+		if (!reservations.empty()) {
+			auto reservation = reservations[batch].GetValue<int64_t>();
+			if (reservation <= 0) {
+				throw BinderException("reservations must be positive");
+			}
+			policy.SetReservation(fixed_bytes, per_worker_bytes, NumericCast<idx_t>(reservation));
+		}
 		vector<Value> row_values;
 		row_values.push_back(Value::BIGINT(NumericCast<int64_t>(batch++)));
 		row_values.push_back(Value::BIGINT(batch_bytes));
@@ -1182,7 +1373,14 @@ DuckLakeSortedMergeWorkerLimitsFunction::DuckLakeSortedMergeWorkerLimitsFunction
                     FunctionSignature()
                         .AddPositionalOnly("memory_limit", LogicalType::VARCHAR)
                         .AddPositionalOnly("threads", LogicalType::BIGINT)
-                        .AddPositionalOnly("batch_bytes", LogicalType::LIST(LogicalType::BIGINT)),
+                        .AddPositionalOnly("batch_bytes", LogicalType::LIST(LogicalType::BIGINT))
+                        .WithTypedKwargs("options",
+                                         [&](TypedKwargs &options) {
+	                                         options.Add("worker_bytes", LogicalType::BIGINT)
+	                                             .Add("fixed_bytes", LogicalType::BIGINT)
+	                                             .Add("per_worker_bytes", LogicalType::BIGINT)
+	                                             .Add("reservations", LogicalType::LIST(LogicalType::BIGINT));
+                                         }),
                     DuckLakeSortedMergeWorkerLimitsExecute, DuckLakeSortedMergeWorkerLimitsBind,
                     DuckLakeRunOnceState::Init) {
 }
