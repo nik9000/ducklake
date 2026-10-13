@@ -264,7 +264,8 @@ struct SortedMergeGlobalState : public GlobalSourceState {
 	//! The bytes per worker for ordering and emitting a batch
 	idx_t worker_bytes = 0;
 	//! The compressed bytes of a row group of the inputs, and the share of them the sort key columns take
-	idx_t compressed_row_group_bytes = 0;
+	double compressed_row_bytes = 0;
+	idx_t file_row_group_rows = 0;
 	//! The share of the decoded bytes of the batches the sort key columns take
 	idx_t decoded_bytes = 0;
 	idx_t decoded_key_bytes = 0;
@@ -387,6 +388,8 @@ struct SortedMergeLocalState : public LocalSourceState {
 static constexpr idx_t UNIT_MEMORY_FRACTION = 16;
 static constexpr idx_t MIN_UNIT_SIZE_BYTES = 1ULL << 20;
 static constexpr idx_t MAX_UNIT_SIZE_BYTES = 32ULL << 20;
+//! Scanners opened to decode ahead before the first batch is measured take at most this fraction of the memory limit
+static constexpr idx_t STARTUP_SCANNER_MEMORY_FRACTION = 8;
 //! Memory limit per segment of sort keys the sequencer may load ahead
 static constexpr idx_t KEY_SEGMENT_MEMORY = 64ULL << 20;
 
@@ -417,7 +420,14 @@ static unique_ptr<SortedMergeGlobalState> InitSortedMergeGlobal(ClientContext &c
 		}
 	}
 	if (file_rows > 0) {
-		result->compressed_row_group_bytes = file_bytes * bind_data.row_group_size / file_rows;
+		result->compressed_row_bytes = double(file_bytes) / double(file_rows);
+	}
+	// the files were written in row groups of the table's setting, which a scanner reads one at a time
+	result->file_row_group_rows = DEFAULT_ROW_GROUP_SIZE;
+	auto &catalog = bind_data.table.ParentCatalog().Cast<DuckLakeCatalog>();
+	string row_group_size_setting;
+	if (catalog.TryGetConfigOption("parquet_row_group_size", row_group_size_setting, bind_data.table)) {
+		result->file_row_group_rows = Value(row_group_size_setting).GetValue<idx_t>();
 	}
 	result->key_column_share = double(MaxValue<idx_t>(result->sequencer->DecodableColumns().size(), 1)) /
 	                           double(bind_data.table.GetColumns().PhysicalColumnCount());
@@ -431,6 +441,14 @@ static unique_ptr<SortedMergeGlobalState> InitSortedMergeGlobal(ClientContext &c
 	}
 	// with too many inputs for units to fit the budget, decoding ahead would only add to the overrun
 	result->decode_ahead = result->unit_size_bytes * input_count <= max_memory / UNIT_MEMORY_FRACTION;
+	// until the first batch is measured, decoding ahead may open a scanner for every input that fits in a share of the
+	// memory limit, sized from the compressed row groups of the files
+	if (result->decode_ahead) {
+		auto compressed_row_group = idx_t(result->compressed_row_bytes * double(result->file_row_group_rows));
+		auto scanner_estimate = MaxValue<idx_t>(3 * compressed_row_group, 1);
+		auto scanners = max_memory / (STARTUP_SCANNER_MEMORY_FRACTION * scanner_estimate);
+		result->max_payload_scanners_ahead = MinValue<idx_t>(input_count, scanners);
+	}
 	result->segment_size = bind_data.row_group_size;
 	result->max_threads = TaskScheduler::GetScheduler(context).NumberOfThreads();
 	auto worker_bytes = DuckLakeSortedMergeSequencer::WorkerBytes(bind_data.row_group_size,
@@ -822,19 +840,27 @@ static idx_t ScannerBytes(idx_t decoded_bytes, double compression_ratio) {
 static void UpdateMergeReservation(ClientContext &context, SortedMergeGlobalState &gstate) {
 	// the decoded bytes of a batch, and how much the inputs compress them, assuming the columns compress alike
 	auto batch_bytes = gstate.worker_policy->AverageBatchBytes();
-	auto compression_ratio =
-	    gstate.compressed_row_group_bytes > 0 ? double(gstate.compressed_row_group_bytes) / double(batch_bytes) : 1.0;
+	auto decoded_row_bytes = double(batch_bytes) / double(MaxValue<idx_t>(gstate.segment_size, 1));
+	auto compression_ratio = gstate.compressed_row_bytes > 0 ? gstate.compressed_row_bytes / decoded_row_bytes : 1.0;
 	auto key_share = gstate.decoded_key_bytes > 0 ? double(gstate.decoded_key_bytes) / double(gstate.decoded_bytes)
 	                                              : gstate.key_column_share;
 	auto key_bytes = idx_t(key_share * double(batch_bytes));
-	idx_t fixed_bytes = gstate.sequencer->MaxSegmentsLoaded() * ScannerBytes(key_bytes, compression_ratio);
-	idx_t per_worker = gstate.worker_bytes;
+	// a scanner reads a row group of the files at a time
+	auto file_row_group_bytes = idx_t(decoded_row_bytes * double(gstate.file_row_group_rows));
+	auto file_row_group_key_bytes = idx_t(key_share * double(file_row_group_bytes));
+	auto segments = gstate.sequencer->MaxSegmentsLoaded();
+	idx_t fixed_bytes = segments * ScannerBytes(file_row_group_key_bytes, compression_ratio);
+	// the keys of the rows a batch merges, and of the chunks every segment loads ahead
+	auto batch_key_bytes = gstate.segment_size * DuckLakeSortedMergeSequencer::KeyRowBytes() + key_bytes;
+	fixed_bytes += segments * gstate.sequencer->ChunksAhead() * batch_key_bytes * STANDARD_VECTOR_SIZE /
+	               MaxValue<idx_t>(gstate.segment_size, 1);
+	idx_t per_worker = gstate.worker_bytes + batch_key_bytes;
 	idx_t payload_scanner = 0;
 	if (gstate.has_payload) {
 		// a unit in use and one decoding for every input
 		fixed_bytes += 2 * gstate.inputs.size() * gstate.unit_size_bytes;
 		// a worker decodes one segment of payload at a time
-		payload_scanner = ScannerBytes(batch_bytes - MinValue(key_bytes, batch_bytes), compression_ratio);
+		payload_scanner = ScannerBytes(file_row_group_bytes - file_row_group_key_bytes, compression_ratio);
 		per_worker += payload_scanner;
 	}
 	if (!gstate.memory_state) {
@@ -842,8 +868,10 @@ static void UpdateMergeReservation(ClientContext &context, SortedMergeGlobalStat
 	}
 	if (fixed_bytes != gstate.reserved_fixed_bytes || per_worker != gstate.reserved_worker_bytes) {
 		gstate.memory_state->SetMinimumReservation(fixed_bytes + per_worker);
-		gstate.memory_state->SetRemainingSizeAndUpdateReservation(context,
-		                                                          fixed_bytes + gstate.max_threads * per_worker);
+		// and decoding ahead one segment of every input
+		auto decode_ahead_bytes = gstate.decode_ahead ? gstate.inputs.size() * payload_scanner : 0;
+		gstate.memory_state->SetRemainingSizeAndUpdateReservation(
+		    context, fixed_bytes + gstate.max_threads * per_worker + decode_ahead_bytes);
 		gstate.reserved_fixed_bytes = fixed_bytes;
 		gstate.reserved_worker_bytes = per_worker;
 		DUCKDB_LOG_DEBUG(context, StringUtil::Format("DuckLake sorted merge: reserved %llu bytes of %llu + %llu x %llu",

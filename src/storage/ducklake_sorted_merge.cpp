@@ -211,10 +211,14 @@ private:
 };
 
 //! The sort keys of a chunk of an input, in file order, or only its row numbers when its keys are not needed
+//! The sort keys and file row numbers of a chunk of an input, in memory that counts against the memory limit
 struct DuckLakeSortedMergeKeyChunk {
-	shared_ptr<Vector> sort_keys;
-	vector<MergeKey> keys;
-	vector<idx_t> row_numbers;
+	explicit DuckLakeSortedMergeKeyChunk(Allocator &allocator) : keys(allocator), row_numbers(allocator) {
+	}
+
+	shared_ptr<DuckLakeKeyData> key_data;
+	DuckLakeAllocatedArray<MergeKey> keys;
+	DuckLakeAllocatedArray<idx_t> row_numbers;
 };
 using KeyChunk = DuckLakeSortedMergeKeyChunk;
 
@@ -652,15 +656,34 @@ void DuckLakeSortedMergeSequencer::LoadKeys(MergeInput &input, KeySegment &segme
 		return;
 	}
 	auto count = segment.scan_chunk.size();
-	auto chunk = make_shared_ptr<KeyChunk>();
+	auto &allocator = BufferAllocator::Get(context);
+	auto chunk = make_shared_ptr<KeyChunk>(allocator);
 	if (!segment.keyless) {
 		segment.key_chunk.Reset();
 		segment.executor->Execute(segment.scan_chunk, segment.key_chunk);
-		chunk->sort_keys = make_shared_ptr<Vector>(LogicalType::BLOB, count);
-		CreateSortKeyHelpers::CreateSortKey(segment.key_chunk, modifiers, *chunk->sort_keys);
+		Vector sort_keys(LogicalType::BLOB, count);
+		CreateSortKeyHelpers::CreateSortKey(segment.key_chunk, modifiers, sort_keys);
+		auto entries = FlatVector::GetData<string_t>(sort_keys);
+		// copy the keys that do not fit in a string_t to memory the chunk owns
+		idx_t key_bytes = 0;
+		for (idx_t i = 0; i < count; i++) {
+			key_bytes += entries[i].IsInlined() ? 0 : entries[i].GetSize();
+		}
+		data_ptr_t key_data = nullptr;
+		if (key_bytes > 0) {
+			chunk->key_data = make_shared_ptr<DuckLakeKeyData>();
+			chunk->key_data->data = allocator.Allocate(key_bytes);
+			key_data = chunk->key_data->data.get();
+		}
 		chunk->keys.reserve(count);
-		for (auto entry : chunk->sort_keys->Values<string_t>()) {
-			chunk->keys.emplace_back(entry.GetValue(), input.key_prefix);
+		for (idx_t i = 0; i < count; i++) {
+			auto key = entries[i];
+			if (!key.IsInlined()) {
+				memcpy(key_data, key.GetData(), key.GetSize());
+				key = string_t(char_ptr_cast(key_data), key.GetSize());
+				key_data += key.GetSize();
+			}
+			chunk->keys.push_back(MergeKey(key, input.key_prefix));
 		}
 	}
 	auto &row_number_vector = segment.scan_chunk.data[segment.scan_chunk.ColumnCount() - 1];
@@ -849,6 +872,10 @@ bool DuckLakeSortedMergeSequencer::StartSegment() {
 		LoadKeys(*target, *segment);
 	}
 	return true;
+}
+
+idx_t DuckLakeSortedMergeSequencer::KeyRowBytes() {
+	return sizeof(MergeKey) + sizeof(idx_t);
 }
 
 idx_t DuckLakeSortedMergeSequencer::MaxSegmentsLoaded() const {
@@ -1324,8 +1351,8 @@ void DuckLakeSortedMergeSequencer::OrderBatch(const DuckLakeSequencedBatch &batc
 		for (auto &part : batch.parts) {
 			for (auto &range : part) {
 				for (auto &chunk : range.chunks) {
-					if (chunk->sort_keys) {
-						keys->owners.push_back(chunk->sort_keys);
+					if (chunk->key_data) {
+						keys->owners.push_back(chunk->key_data);
 					}
 				}
 			}

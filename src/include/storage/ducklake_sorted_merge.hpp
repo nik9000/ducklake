@@ -157,6 +157,11 @@ public:
 		}
 		data()[count++] = value;
 	}
+	void reserve(idx_t new_capacity) {
+		if (new_capacity > capacity) {
+			Grow(new_capacity);
+		}
+	}
 	//! Sets the size without initializing new values
 	void resize(idx_t new_count) {
 		if (new_count > capacity) {
@@ -198,6 +203,11 @@ private:
 	idx_t capacity = 0;
 };
 
+//! The bytes of the sort keys of a chunk that do not fit in a string_t
+struct DuckLakeKeyData {
+	AllocatedData data;
+};
+
 //! The sort keys of sequenced rows in merged order, sharing the sequencer's key data
 struct DuckLakeMergeKeys {
 	explicit DuckLakeMergeKeys(Allocator &allocator) : keys(allocator) {
@@ -205,7 +215,7 @@ struct DuckLakeMergeKeys {
 
 	DuckLakeAllocatedArray<string_t> keys;
 	//! Keep the key data alive
-	vector<shared_ptr<Vector>> owners;
+	vector<shared_ptr<DuckLakeKeyData>> owners;
 
 	void Clear() {
 		keys.clear();
@@ -312,6 +322,12 @@ public:
 	}
 	//! The most segments of sort keys loaded at once, each with its own scanner
 	idx_t MaxSegmentsLoaded() const;
+	//! The chunks of keys a segment loads ahead
+	idx_t ChunksAhead() const {
+		return chunks_ahead;
+	}
+	//! The memory of the sort keys and row number of a row, apart from the bytes of the key
+	static idx_t KeyRowBytes();
 
 private:
 	struct KeySegment;
