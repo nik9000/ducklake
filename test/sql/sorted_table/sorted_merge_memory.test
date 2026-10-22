@@ -82,3 +82,9 @@ query I
 SELECT count(*) FROM ((FROM merged EXCEPT ALL FROM ducklake.wide) UNION ALL (FROM ducklake.wide EXCEPT ALL FROM merged))
 ----
 0
+
+# compaction estimates the merge from the catalog's row counts
+query II
+EXPLAIN CALL ducklake_merge_adjacent_files('ducklake', 'wide')
+----
+physical_plan	<REGEX>:.*Ducklake Sorted Merge.*~480,000 rows.*

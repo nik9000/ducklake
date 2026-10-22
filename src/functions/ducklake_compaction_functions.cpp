@@ -627,8 +627,12 @@ DuckLakeCompactor::GenerateCompactionCommand(vector<DuckLakeCompactionFileEntry>
 			// every file is sorted on the table's sort already: merge them instead of sorting them
 			auto &scan_slot = root->type == LogicalOperatorType::LOGICAL_PROJECTION ? root->children[0] : root;
 			auto table_index = scan_slot->Cast<LogicalGet>().table_index;
+			idx_t estimated_rows = 0;
+			for (auto &source : actionable_source_files) {
+				estimated_rows += source.file.row_count - source.inlined_file_deletions.size();
+			}
 			scan_slot = PlanDuckLakeSortedMerge(table, std::move(merge_files), table_index, DEFAULT_ROW_GROUP_SIZE,
-			                                    write_snapshot_id);
+			                                    write_snapshot_id, estimated_rows);
 			root->ResolveOperatorTypes();
 		} else {
 			root = DuckLakeCompactor::InsertSort(binder, root, latest_table, sort_data);

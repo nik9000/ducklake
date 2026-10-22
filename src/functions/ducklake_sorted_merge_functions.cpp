@@ -173,6 +173,8 @@ struct SortedMergeBindData {
 	optional_idx decode_unit_size;
 	//! Whether each row's snapshot id follows the table's columns, as compaction writes it
 	bool write_snapshot_id = false;
+	//! The rows of the files, from the catalog
+	idx_t estimated_rows = 0;
 };
 
 //! The live rows of input rows [row_start, row_end), decoded once and shared by every batch that reads them
@@ -232,12 +234,50 @@ struct SortedMergeInputReader {
 };
 
 //! The inherited lock guards the batch counts and the parked workers
+//! Lets the sorted merges of a query run one at a time. A merge sizes its workers and buffers to the memory limit, so
+//! the merges of other compaction groups in the same query wait for it instead of running alongside it.
+class SortedMergeGate : public ClientContextState, public StateWithBlockableTasks {
+public:
+	static constexpr const char *KEY = "ducklake_sorted_merge_gate";
+
+	//! Admit the merge, or park the task until the running merge is done. Returns false when the task is parked.
+	bool Admit(const void *merge, const InterruptState &interrupt_state) {
+		annotated_lock_guard<annotated_mutex> guard(lock);
+		if (!running || running == merge) {
+			running = merge;
+			return true;
+		}
+		// a pipeline that is finishing cannot park its tasks, so the merge goes ahead
+		return !interrupt_state.CanCallback() || !BlockTask(interrupt_state);
+	}
+	void Release(const void *merge) {
+		annotated_lock_guard<annotated_mutex> guard(lock);
+		if (running == merge) {
+			running = nullptr;
+			UnblockTasks();
+		}
+	}
+	void QueryEnd(ClientContext &context) override {
+		annotated_lock_guard<annotated_mutex> guard(lock);
+		running = nullptr;
+		ResetBlocking();
+	}
+
+private:
+	const void *running DUCKDB_GUARDED_BY(lock) = nullptr;
+};
+
 struct SortedMergeGlobalState : public GlobalSourceState {
 	~SortedMergeGlobalState() override {
+		gate->Release(this);
 		// every segment closes its scanner
 		readers.clear();
 		D_ASSERT(open_payload_scanners == 0);
 	}
+
+	//! Shared by the sorted merges of the query, and whether this merge may run
+	shared_ptr<SortedMergeGate> gate;
+	atomic<bool> admitted {false};
 
 	//! Segments of payload with an open scanner, and how many the memory reservation allows decoding ahead to keep open
 	atomic<idx_t> open_payload_scanners {0};
@@ -261,6 +301,7 @@ struct SortedMergeGlobalState : public GlobalSourceState {
 	unique_ptr<TemporaryMemoryState> memory_state;
 	idx_t reserved_fixed_bytes = 0;
 	idx_t reserved_worker_bytes = 0;
+	idx_t peak_reservation = 0;
 	//! The bytes per worker for ordering and emitting a batch
 	idx_t worker_bytes = 0;
 	//! The compressed bytes of a row group of the inputs, and the share of them the sort key columns take
@@ -455,6 +496,7 @@ static unique_ptr<SortedMergeGlobalState> InitSortedMergeGlobal(ClientContext &c
 	                                                              !result->sequencer->DecodableColumns().empty());
 	result->worker_bytes = worker_bytes;
 	result->worker_policy = make_uniq<DuckLakeSortedMergeWorkerPolicy>(result->max_threads, worker_bytes);
+	result->gate = context.registered_state->GetOrCreate<SortedMergeGate>(SortedMergeGate::KEY);
 	return std::move(result);
 }
 
@@ -691,6 +733,13 @@ enum class SortedMergeBatchResult : uint8_t { LOADED, FINISHED, PARKED };
 static SortedMergeBatchResult LoadSortedMergeBatch(ClientContext &context, const SortedMergeBindData &bind_data,
                                                    SortedMergeGlobalState &gstate, SortedMergeLocalState &lstate,
                                                    OperatorSourceInput &input) {
+	if (!gstate.admitted) {
+		if (!gstate.gate->Admit(&gstate, input.interrupt_state)) {
+			DUCKDB_LOG_DEBUG(context, "DuckLake sorted merge: waiting for another sorted merge of the query");
+			return SortedMergeBatchResult::PARKED;
+		}
+		gstate.admitted = true;
+	}
 	// a worker over the limit loads sort keys and decodes units ahead for the next batches before it parks
 	bool nothing_to_decode = false;
 	while (true) {
@@ -776,6 +825,8 @@ static SortedMergeBatchResult LoadSortedMergeBatch(ClientContext &context, const
 				gstate.sequencer_exhausted = true;
 			}
 			WakeParkedWorkers(gstate);
+			// the next merge of the query can start while this one emits its last batches
+			gstate.gate->Release(&gstate);
 			return SortedMergeBatchResult::FINISHED;
 		}
 		lstate.batch_index = gstate.next_batch_index++;
@@ -874,19 +925,52 @@ static void UpdateMergeReservation(ClientContext &context, SortedMergeGlobalStat
 		    context, fixed_bytes + gstate.max_threads * per_worker + decode_ahead_bytes);
 		gstate.reserved_fixed_bytes = fixed_bytes;
 		gstate.reserved_worker_bytes = per_worker;
-		DUCKDB_LOG_DEBUG(context, StringUtil::Format("DuckLake sorted merge: reserved %llu bytes of %llu + %llu x %llu",
-		                                             gstate.memory_state->GetReservation(), fixed_bytes,
-		                                             gstate.max_threads, per_worker));
 	} else {
 		gstate.memory_state->UpdateReservation(context);
 	}
 	auto reservation = gstate.memory_state->GetReservation();
+	gstate.peak_reservation = MaxValue(gstate.peak_reservation, reservation);
 	gstate.worker_policy->SetReservation(fixed_bytes, per_worker, reservation);
 	// decoding ahead may keep open the scanners of the workers, and of what the reservation has left over
 	auto workers = gstate.worker_policy->WorkerLimit(BufferManager::GetBufferManager(context).GetMaxMemory());
 	auto used = fixed_bytes + workers * per_worker;
 	auto spare_scanners = payload_scanner > 0 && reservation > used ? (reservation - used) / payload_scanner : 0;
 	gstate.max_payload_scanners_ahead = workers + spare_scanners;
+	DUCKDB_LOG_DEBUG(context, StringUtil::Format("DuckLake sorted merge: reserved %llu bytes of %llu + %llu x %llu, "
+	                                             "%llu workers for %llu byte batches",
+	                                             reservation, fixed_bytes, gstate.max_threads, per_worker, workers,
+	                                             batch_bytes));
+}
+
+//! The profiler keeps the extra info of the thread that flushes last, so every thread writes the merge-wide numbers
+static void WriteSortedMergeProfile(ExecutionContext &context, const PhysicalOperator &op,
+                                    SortedMergeGlobalState &gstate) DUCKDB_REQUIRES(gstate.lock) {
+	if (QueryProfiler::Get(context.client).IsEnabled()) {
+		auto info = op.ParamsToString();
+		info["Worker Limit"] = to_string(gstate.worker_limit);
+		if (gstate.max_worker_limit > 0) {
+			info["Worker Limit Range"] =
+			    to_string(gstate.min_worker_limit) + " - " + to_string(gstate.max_worker_limit);
+		}
+		info["Peak Active Workers"] = to_string(gstate.peak_batches_in_flight);
+		info["Average Batch Bytes"] = to_string(gstate.worker_policy->AverageBatchBytes());
+		info["Batches"] = to_string(gstate.batches_emitted);
+		info["Parks"] = to_string(gstate.parks);
+		info["Units Decoded Ahead"] =
+		    gstate.decode_ahead ? to_string(gstate.units_decoded_ahead.load()) : "off (too many inputs)";
+		info["Columns From Sort Keys"] = to_string(gstate.sequencer->DecodableColumns().size());
+		info["Sections"] = to_string(gstate.sequencer->SectionCount());
+		info["Sections Merged Without Keys"] = to_string(gstate.sequencer->KeylessSectionCount());
+		info["Decode Unit Bytes"] = to_string(gstate.unit_size_bytes);
+		if (gstate.memory_state) {
+			info["Memory Reservation"] =
+			    to_string(gstate.peak_reservation) + " of " + to_string(gstate.reserved_fixed_bytes) + " + " +
+			    to_string(gstate.max_threads) + " x " + to_string(gstate.reserved_worker_bytes);
+		}
+		auto &metrics = context.thread.profiler.GetOperatorMetrics(op);
+		metrics.name = op.GetName();
+		metrics.SetExtraInfo(std::move(info));
+	}
 }
 
 static void FinishSortedMergeBatch(ExecutionContext &context, const PhysicalOperator &op,
@@ -912,36 +996,15 @@ static void FinishSortedMergeBatch(ExecutionContext &context, const PhysicalOper
 			gstate.decoded_bytes += lstate.batch_bytes;
 			gstate.decoded_key_bytes += lstate.batch_key_bytes;
 		}
-		if (gstate.worker_policy->AverageBatchBytes() > 0) {
+		if (gstate.sequencer_exhausted && gstate.batches_in_flight == 0) {
+			// the last batch is out, so the query's other merges can have the memory
+			if (gstate.memory_state) {
+				gstate.memory_state->SetZero();
+			}
+		} else if (gstate.worker_policy->AverageBatchBytes() > 0) {
 			UpdateMergeReservation(context.client, gstate);
 		}
-		if (QueryProfiler::Get(context.client).IsEnabled()) {
-			// the profiler keeps the extra info of the thread that flushes last, so write the merge-wide numbers
-			InsertionOrderPreservingMap<string> info;
-			info["Worker Limit"] = to_string(gstate.worker_limit);
-			if (gstate.max_worker_limit > 0) {
-				info["Worker Limit Range"] =
-				    to_string(gstate.min_worker_limit) + " - " + to_string(gstate.max_worker_limit);
-			}
-			info["Peak Active Workers"] = to_string(gstate.peak_batches_in_flight);
-			info["Average Batch Bytes"] = to_string(gstate.worker_policy->AverageBatchBytes());
-			info["Batches"] = to_string(gstate.batches_emitted);
-			info["Parks"] = to_string(gstate.parks);
-			info["Units Decoded Ahead"] =
-			    gstate.decode_ahead ? to_string(gstate.units_decoded_ahead.load()) : "off (too many inputs)";
-			info["Columns From Sort Keys"] = to_string(gstate.sequencer->DecodableColumns().size());
-			info["Sections"] = to_string(gstate.sequencer->SectionCount());
-			info["Sections Merged Without Keys"] = to_string(gstate.sequencer->KeylessSectionCount());
-			info["Decode Unit Bytes"] = to_string(gstate.unit_size_bytes);
-			if (gstate.memory_state) {
-				info["Memory Reservation"] =
-				    to_string(gstate.memory_state->GetReservation()) + " of " + to_string(gstate.reserved_fixed_bytes) +
-				    " + " + to_string(gstate.max_threads) + " x " + to_string(gstate.reserved_worker_bytes);
-			}
-			auto &metrics = context.thread.profiler.GetOperatorMetrics(op);
-			metrics.name = op.GetName();
-			metrics.SetExtraInfo(std::move(info));
-		}
+		WriteSortedMergeProfile(context, op, gstate);
 	}
 	WakeParkedWorkers(gstate);
 }
@@ -1100,16 +1163,29 @@ static void EmitSortedMergeRows(SortedMergeLocalState &lstate, DataChunk &output
 class DuckLakeSortedMergeSource : public PhysicalOperator {
 public:
 	DuckLakeSortedMergeSource(PhysicalPlan &physical_plan, const vector<LogicalType> &types,
-	                          shared_ptr<SortedMergeBindData> bind_data_p)
-	    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, types, 0),
-	      bind_data(std::move(bind_data_p)) {
+	                          shared_ptr<SortedMergeBindData> bind_data_p, idx_t thread_count)
+	    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, types, bind_data_p->estimated_rows),
+	      bind_data(std::move(bind_data_p)), thread_count(thread_count) {
 	}
 
 	shared_ptr<SortedMergeBindData> bind_data;
+	idx_t thread_count;
 
 public:
+	InsertionOrderPreservingMap<string> ParamsToString() const override {
+		InsertionOrderPreservingMap<string> result;
+		SetEstimatedCardinality(result, estimated_cardinality);
+		return result;
+	}
+
 	bool IsSource() const override {
 		return true;
+	}
+
+	idx_t EstimatedThreadCount() const override {
+		// the merge sizes its workers from the memory it is granted, so it needs the memory of the whole query and
+		// reports more than the threads to keep the union of a compaction from running merges side by side
+		return MaxValue(PhysicalOperator::EstimatedThreadCount(), thread_count + 1);
 	}
 
 	bool ParallelSource() const override {
@@ -1150,8 +1226,11 @@ protected:
 		while (chunk.size() == 0) {
 			if (!lstate.has_batch) {
 				switch (LoadSortedMergeBatch(context.client, *bind_data, gstate, lstate, input)) {
-				case SortedMergeBatchResult::FINISHED:
+				case SortedMergeBatchResult::FINISHED: {
+					annotated_lock_guard<annotated_mutex> guard(gstate.lock);
+					WriteSortedMergeProfile(context, *this, gstate);
 					return SourceResultType::FINISHED;
+				}
 				case SortedMergeBatchResult::PARKED:
 					return SourceResultType::BLOCKED;
 				case SortedMergeBatchResult::LOADED:
@@ -1180,7 +1259,12 @@ public:
 
 public:
 	PhysicalOperator &CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) override {
-		return planner.Make<DuckLakeSortedMergeSource>(types, bind_data);
+		return planner.Make<DuckLakeSortedMergeSource>(types, bind_data,
+		                                               TaskScheduler::GetScheduler(context).NumberOfThreads());
+	}
+
+	idx_t EstimateCardinality(ClientContext &context) override {
+		return bind_data->estimated_rows;
 	}
 
 	string GetName() const override {
@@ -1222,7 +1306,7 @@ static unique_ptr<LogicalOperator> DuckLakeSortedMergeBind(ClientContext &contex
 
 unique_ptr<LogicalOperator> PlanDuckLakeSortedMerge(DuckLakeTableEntry &table, vector<DuckLakeFileListEntry> files,
                                                     TableIndex table_index, idx_t row_group_size,
-                                                    bool write_snapshot_id) {
+                                                    bool write_snapshot_id, idx_t estimated_rows) {
 	vector<LogicalType> return_types;
 	for (auto &column : table.GetColumns().Physical()) {
 		return_types.push_back(column.Type());
@@ -1235,6 +1319,7 @@ unique_ptr<LogicalOperator> PlanDuckLakeSortedMerge(DuckLakeTableEntry &table, v
 	bind_data->files = std::move(files);
 	bind_data->row_group_size = row_group_size;
 	bind_data->write_snapshot_id = write_snapshot_id;
+	bind_data->estimated_rows = estimated_rows;
 	return make_uniq<DuckLakeLogicalSortedMerge>(table_index, std::move(bind_data), std::move(return_types));
 }
 
