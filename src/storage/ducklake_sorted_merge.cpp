@@ -336,7 +336,7 @@ DuckLakeSortedMergeSequencer::DuckLakeSortedMergeSequencer(ClientContext &contex
 	}
 	auto binder = Binder::CreateBinder(context);
 	TableIndex table_index(0);
-	auto orders = DuckLakeCompactor::BindSortOrders(*binder, table.GetColumns(), table.name, table_index,
+	auto orders = DuckLakeCompactor::BindSortOrders(*binder, table.schema, table.GetColumns(), table.name, table_index,
 	                                                DuckLakeCompactor::ParseSortOrders(*sort_data));
 	if (orders.empty()) {
 		throw InvalidInputException("Table %s has no sort key in the DuckDB dialect to merge on", table.name);

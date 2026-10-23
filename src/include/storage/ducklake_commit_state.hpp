@@ -18,7 +18,15 @@
 
 namespace duckdb {
 
+//! The fields a commit adds to a table
+struct DuckLakeAddedFields {
+	TableIndex table_id;
+	reference<const DuckLakeTableEntry> table;
+	set<FieldIndex> fields;
+};
+
 struct NewTableInfo {
+	vector<DuckLakeAddedFields> added_fields;
 	vector<DuckLakeTableInfo> new_tables;
 	vector<DuckLakeViewInfo> new_views;
 	vector<DuckLakePartitionInfo> new_partition_keys;
@@ -27,6 +35,7 @@ struct NewTableInfo {
 	vector<DuckLakeViewColumnTagInfo> new_view_column_tags;
 	vector<DuckLakeDroppedColumn> dropped_columns;
 	vector<DuckLakeNewColumn> new_columns;
+	vector<DuckLakeNewColumn> dropped_new_columns;
 	vector<DuckLakeTableInfo> new_inlined_data_tables;
 	vector<DuckLakeSortInfo> new_sort_keys;
 	vector<DuckLakeConfigOption> new_table_options;
@@ -61,6 +70,24 @@ struct DuckLakeCommitState {
 	map<idx_t, idx_t> committed_sort_ids;
 	map<MappingIndex, MappingIndex> committed_mapping_indexes;
 	map<TableIndex, vector<DuckLakeDeleteFile>> local_delete_files;
+	//! The columns this commit widens from FLOAT to DOUBLE
+	map<TableIndex, set<FieldIndex>> float_widened_columns;
+	//! The widened columns with values that read as DOUBLE without FLOAT rounding
+	map<TableIndex, set<FieldIndex>> float_bounds_to_clear;
+	//! The oid of each entry that gets its id in this commit
+	ducklake_entry_oids_t new_entry_oids;
+	//! The existing tables that get a new inlined data table in this commit
+	set<TableIndex> replaced_inlined_tables;
+
+	void AddNewEntry(const CatalogEntry &entry, idx_t id) {
+		new_entry_oids.emplace(make_pair(entry.type, id), entry.oid);
+	}
+
+	//! Whether this commit widens a column of the given table from FLOAT to DOUBLE
+	bool WidensFloatColumns(TableIndex table_id) const;
+	//! Widen the FLOAT bounds of a widened column, or clear them when they cannot be widened
+	void PrepareFloatBounds(TableIndex table_id, map<FieldIndex, DuckLakeColumnStats> &column_stats,
+	                        bool can_widen = true) const;
 
 	void RemapIdentifier(SchemaIndex &schema_id) const {
 		auto entry = committed_schemas.find(schema_id);

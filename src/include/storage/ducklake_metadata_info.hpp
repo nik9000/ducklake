@@ -94,6 +94,16 @@ struct DuckLakeInlinedTableInfo {
 	idx_t schema_version;
 };
 
+//! The schema versions of the creation and the last schema change of a table
+struct DuckLakeTableSchemaVersions {
+	optional_idx creation;
+	optional_idx last_change;
+
+	bool ChangedSinceCreation() const {
+		return creation.IsValid() && last_change.IsValid() && creation.GetIndex() != last_change.GetIndex();
+	}
+};
+
 struct DuckLakeTableInfo {
 	TableIndex id;
 	SchemaIndex schema_id;
@@ -217,20 +227,16 @@ struct DuckLakePartitionFieldInfo {
 	bool operator==(const DuckLakePartitionFieldInfo &new_field) const {
 		return field_id == new_field.field_id && transform == new_field.transform;
 	}
-	bool operator!=(const DuckLakePartitionFieldInfo &new_field) const {
-		return !(*this == new_field);
-	}
 };
 
 struct DuckLakePartitionInfo {
 	optional_idx id;
 	TableIndex table_id;
 	vector<DuckLakePartitionFieldInfo> fields;
+	//! Replaces the current spec even if it has the same fields
+	bool replaces_equal_spec = false;
 	bool operator==(const DuckLakePartitionInfo &new_partition) const {
 		return table_id == new_partition.table_id && fields == new_partition.fields;
-	}
-	bool operator!=(vector<DuckLakePartitionInfo>::const_reference value) const {
-		return !(*this == value);
 	}
 };
 
@@ -244,9 +250,6 @@ struct DuckLakeSortFieldInfo {
 		return expression == new_field.expression && dialect == new_field.dialect &&
 		       sort_direction == new_field.sort_direction && null_order == new_field.null_order;
 	}
-	bool operator!=(const DuckLakeSortFieldInfo &new_field) const {
-		return !(*this == new_field);
-	}
 };
 
 struct DuckLakeSortInfo {
@@ -255,9 +258,6 @@ struct DuckLakeSortInfo {
 	vector<DuckLakeSortFieldInfo> fields;
 	bool operator==(const DuckLakeSortInfo &new_sort) const {
 		return table_id == new_sort.table_id && fields == new_sort.fields;
-	}
-	bool operator!=(vector<DuckLakeSortInfo>::const_reference value) const {
-		return !(*this == value);
 	}
 };
 
@@ -396,6 +396,8 @@ struct DuckLakeFileColumnStats {
 	string max;
 	bool has_min = false;
 	bool has_max = false;
+	bool contains_nan = false;
+	bool has_contains_nan = false;
 };
 
 struct DuckLakeFileListEntry {
@@ -404,7 +406,6 @@ struct DuckLakeFileListEntry {
 	DuckLakeFileData delete_file;
 	optional_idx row_id_start;
 	optional_idx snapshot_id;
-	optional_idx max_row_count;
 	//! Upper bound filter, we only include rows where _ducklake_internal_snapshot_id <= snapshot_filter
 	optional_idx snapshot_filter_max;
 	//! Lower bound filter, we only include rows where _ducklake_internal_snapshot_id >= snapshot_filter_min
@@ -417,6 +418,8 @@ struct DuckLakeFileListEntry {
 	set<idx_t> inlined_file_deletions;
 	//! Column min/max values for runtime filter pushdown
 	unordered_map<idx_t, DuckLakeFileColumnStats> column_min_max;
+	//! The rows of committed inlined data, when they are read before the file list
+	shared_ptr<DuckLakeCommittedInlinedRows> inlined_rows;
 };
 
 struct DuckLakeDeleteScanEntry {
@@ -427,6 +430,10 @@ struct DuckLakeDeleteScanEntry {
 	optional_idx row_id_start;
 	MappingIndex mapping_id;
 	optional_idx snapshot_id;
+	//! The snapshot that inserted every row of the data file, unset when its rows carry their own
+	optional_idx insert_snapshot;
+	//! Whether the data file itself was deleted at snapshot_id
+	bool file_deleted = false;
 	//! The start of the snapshot range for filtering
 	optional_idx start_snapshot;
 	//! The end of the snapshot range for filtering
@@ -457,7 +464,6 @@ struct DuckLakeCompactionBaseFileData {
 	idx_t row_count = 0;
 	idx_t begin_snapshot = 0;
 	optional_idx end_snapshot;
-	optional_idx max_row_count;
 };
 
 struct DuckLakeFileForCleanup {

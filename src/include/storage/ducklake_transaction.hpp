@@ -56,6 +56,8 @@ public:
 struct FlushedInlinedTableInfo {
 	DuckLakeInlinedTableInfo inlined_table;
 	idx_t flush_snapshot_id;
+	//! A flush that writes no file leaves no rows to delete
+	bool wrote_files = true;
 };
 
 struct DroppedDataFileStats {
@@ -70,7 +72,10 @@ struct LocalTableDataChanges {
 	unordered_map<string, unique_ptr<DuckLakeInlinedDataDeletes>> new_inlined_data_deletes;
 	unique_ptr<DuckLakeInlinedFileDeletes> new_inlined_file_deletes;
 	vector<DuckLakeCompactionEntry> compactions;
+	//! The source files of the compactions
+	set<DataFileIndex> compacted_files;
 	bool IsEmpty() const;
+	void AddWrittenFiles(vector<string> &data_files, vector<string> &other_files, bool include_added_files) const;
 };
 
 class LocalTableChangeIterationHelper {
@@ -103,28 +108,41 @@ public:
 	LocalTableChangeIterationHelper Changes() const;
 	void CleanupFiles(DatabaseInstance &db);
 	void CleanupFiles(ClientContext &context, TableIndex table_id);
+	void GetWrittenFiles(vector<string> &result) const;
 	bool HasTransactionLocalInserts(TableIndex table_id) const;
 	bool HasTransactionInlinedData(TableIndex table_id) const;
 	vector<DuckLakeDataFile> GetTransactionLocalFiles(TableIndex table_id) const;
 	shared_ptr<DuckLakeInlinedData> GetTransactionLocalInlinedData(ClientContext &context, TableIndex table_id) const;
-	void DropTransactionLocalFile(ClientContext &context, TableIndex table_id, const string &path);
+	//! Returns false for a file whose rows keep their history
+	bool TryDropTransactionLocalFile(ClientContext &context, TableIndex table_id, const string &path);
 	void AppendFiles(TableIndex table_id, vector<DuckLakeDataFile> files);
 	void AppendDeleteFiles(TableIndex table_id, const string &data_file_path, vector<DuckLakeDeleteFile> files);
 	void AppendInlinedData(ClientContext &context, TableIndex table_id, unique_ptr<DuckLakeInlinedData> new_data);
 	void AddNewInlinedDeletes(TableIndex table_id, const string &table_name, set<idx_t> new_deletes);
-	void DeleteFromLocalInlinedData(ClientContext &context, TableIndex table_id, set<idx_t> new_deletes);
+	void DeleteFromLocalInlinedData(ClientContext &context, DuckLakeTableEntry &table, set<idx_t> new_deletes);
+	void SetOutdatedStatsTable(TableIndex table_id, DuckLakeTableEntry &table);
+	//! Recompute the inlined column stats that deletes left outdated
+	void RecomputeOutdatedStats(ClientContext &context);
 	void AddColumnToLocalInlinedData(ClientContext &context, TableIndex table_id, const LogicalType &new_column_type,
 	                                 FieldIndex new_field_index, const Value &default_value);
 	void RemoveColumnFromLocalInlinedData(ClientContext &context, TableIndex table_id,
 	                                      LogicalIndex removed_column_index, const DuckLakeFieldId &field_id);
+	//! Records what the files written before the fields were added read for them
+	void AddFieldsToLocalFiles(TableIndex table_id, const DuckLakeTableEntry &table, const set<FieldIndex> &fields);
 	optional_ptr<DuckLakeInlinedDataDeletes> GetInlinedDeletes(TableIndex table_id, const string &table_name) const;
 	void AddNewInlinedFileDeletes(TableIndex table_id, idx_t file_id, set<idx_t> new_deletes);
-	void AddCompaction(TableIndex table_id, DuckLakeCompactionEntry entry);
+	//! Returns false without adding it when one of its source files is already compacted
+	bool AddCompaction(TableIndex table_id, DuckLakeCompactionEntry entry);
+	set<DataFileIndex> GetCompactedFiles(TableIndex table_id) const;
+	set<TableIndex> GetCompactedTables() const;
 	bool HasLocalDeletes(TableIndex table_id) const;
 	bool HasLocalDeleteForFile(TableIndex table_id, const string &path) const;
 	bool HasAnyLocalChanges(TableIndex table_id) const;
 
-	void GetLocalDeleteForFile(TableIndex table_id, const string &path, DuckLakeFileData &result) const;
+	//! The latest delete file the transaction wrote for a committed data file
+	bool GetLocalDeleteFile(TableIndex table_id, const string &path, DuckLakeDeleteFile &result) const;
+	bool GetLocalDeleteForFile(TableIndex table_id, const string &path, DuckLakeFileData &result,
+	                           optional_idx &begin_snapshot) const;
 	bool HasLocalInlinedFileDeletes(TableIndex table_id) const;
 
 	void GetLocalInlinedFileDeletesForFile(TableIndex table_id, idx_t file_id, set<idx_t> &result) const;
@@ -157,6 +175,8 @@ struct DuckLakeRetryConfig {
 	double retry_backoff = 1.5;
 
 	static DuckLakeRetryConfig FromContext(ClientContext &context);
+	//! The wait of an attempt, never longer than the milliseconds left
+	idx_t WaitMs(idx_t attempt, idx_t remaining_ms, double multiplier = 1.0) const;
 };
 
 class DuckLakeTransaction : public Transaction, public enable_shared_from_this<DuckLakeTransaction> {
@@ -183,11 +203,11 @@ public:
 	}
 
 	DuckLakeSnapshotCommit &GetCommitInfo();
-	unique_ptr<QueryResult> Query(DuckLakeSnapshot snapshot, string query);
-	unique_ptr<QueryResult> Query(string query);
 	//! Execute SQL on the metadata connection without placeholder substitution or metadata-manager wrapping.
 	unique_ptr<QueryResult> ExecuteRaw(string query);
 	Connection &GetConnection();
+	//! Releases the metadata transaction until the next metadata access
+	void ReleaseMetadataTransaction();
 
 	//! Keep a schema cache entry alive for as long as this transaction lives. Transaction-local catalog entries hold
 	//! bare references into the cached catalog set, and those references are read again at commit time, so the entry
@@ -197,6 +217,8 @@ public:
 	DuckLakeSnapshot GetSnapshot();
 	DuckLakeSnapshot GetSnapshot(optional_ptr<BoundAtClause> at_clause,
 	                             SnapshotBound bound = SnapshotBound::UPPER_BOUND);
+	//! The newest snapshot that the transaction sees, also when the catalog is opened at a fixed snapshot
+	idx_t GetNewestVisibleSnapshotId();
 
 	static DuckLakeTransaction &Get(ClientContext &context, Catalog &catalog);
 
@@ -217,14 +239,17 @@ public:
 	optional_ptr<DuckLakeCatalogSet> GetTransactionLocalEntries(CatalogType type, SchemaIndex schema_id);
 	optional_ptr<CatalogEntry> GetTransactionLocalEntry(CatalogType catalog_type, SchemaIndex schema_id,
 	                                                    const string &entry_name);
+	void GetWrittenFiles(vector<string> &result) const;
 	vector<DuckLakeDataFile> GetTransactionLocalFiles(TableIndex table_id) const;
 	shared_ptr<DuckLakeInlinedData> GetTransactionLocalInlinedData(TableIndex table_id) const;
-	void DropTransactionLocalFile(TableIndex table_id, const string &path);
+	bool TryDropTransactionLocalFile(TableIndex table_id, const string &path);
 	bool HasTransactionLocalInserts(TableIndex table_id) const;
 	bool HasTransactionInlinedData(TableIndex table_id) const;
 	void AppendFiles(TableIndex table_id, vector<DuckLakeDataFile> files);
 	void AddDeletes(TableIndex table_id, vector<DuckLakeDeleteFile> files);
-	void AddCompaction(TableIndex table_id, DuckLakeCompactionEntry entry);
+	bool AddCompaction(TableIndex table_id, DuckLakeCompactionEntry entry);
+	//! Source files of the compactions recorded earlier in this transaction
+	set<DataFileIndex> GetCompactedFiles(TableIndex table_id) const;
 
 	MappingIndex AddNameMap(unique_ptr<DuckLakeNameMap> name_map);
 	shared_ptr<const DuckLakeNameMap> GetMappingById(MappingIndex mapping_id);
@@ -235,7 +260,7 @@ public:
 	void SetRequiresNewInlinedTable(bool requires_new);
 	bool GetRequiresNewInlinedTable() const;
 	void AddNewInlinedDeletes(TableIndex table_id, const string &table_name, set<idx_t> new_deletes);
-	void DeleteFromLocalInlinedData(TableIndex table_id, set<idx_t> new_deletes);
+	void DeleteFromLocalInlinedData(DuckLakeTableEntry &table, set<idx_t> new_deletes);
 	void AddColumnToLocalInlinedData(TableIndex table_id, const LogicalType &new_column_type,
 	                                 FieldIndex new_field_index, const Value &default_value = Value());
 	void RemoveColumnFromLocalInlinedData(TableIndex table_id, LogicalIndex removed_column_index,
@@ -256,15 +281,15 @@ public:
 	void MarkDeleteAttempted(TableIndex table_id);
 
 	void DeleteSnapshots(const vector<DuckLakeSnapshotInfo> &snapshots);
-	void DeleteInlinedData(const DuckLakeInlinedTableInfo &inlined_table);
 	//! Marks the inlined data flushed up to the snapshot, the commit deletes its rows
-	void MarkInlinedDataForDeletion(DuckLakeInlinedTableInfo inlined_table, idx_t flush_snapshot_id);
+	void MarkInlinedDataForDeletion(DuckLakeInlinedTableInfo inlined_table, idx_t flush_snapshot_id, bool wrote_files);
 	bool InlinedTableFlushed(const string &table_name);
 	//! Marks the inlined file deletions of the table flushed up to the snapshot, the commit deletes them
 	void MarkInlinedFileDeletionsFlushed(TableIndex table_id, idx_t flush_snapshot_id);
 	bool InlinedFileDeletionsFlushed(TableIndex table_id);
 
 	bool ChangesMade() const;
+	bool SchemaChangesMade() const;
 	idx_t GetLocalCatalogId();
 	static bool IsTransactionLocal(idx_t id) {
 		return id >= DuckLakeConstants::TRANSACTION_LOCAL_ID_START;
@@ -278,7 +303,9 @@ public:
 
 	bool HasLocalDeletes(TableIndex table_id) const;
 	bool HasLocalDeleteForFile(TableIndex table_id, const string &path) const;
-	void GetLocalDeleteForFile(TableIndex table_id, const string &path, DuckLakeFileData &delete_file) const;
+	bool GetLocalDeleteFile(TableIndex table_id, const string &path, DuckLakeDeleteFile &result) const;
+	bool GetLocalDeleteForFile(TableIndex table_id, const string &path, DuckLakeFileData &delete_file,
+	                           optional_idx &begin_snapshot) const;
 	void TransactionLocalDelete(TableIndex table_id, const string &data_path, DuckLakeDeleteFile delete_file);
 
 	bool HasLocalInlinedFileDeletes(TableIndex table_id) const;
@@ -301,9 +328,6 @@ public:
 	static string GenerateUUIDv7();
 
 	const LocalTableChanges &GetLocalChanges() const;
-	const set<TableIndex> &GetDroppedViews();
-	const set<MacroIndex> &GetDroppedScalarMacros();
-	const set<MacroIndex> &GetDroppedTableMacros();
 	//! Returns the current version of the catalog:
 	//! If there are no uncommitted changes, this is the schema version of the snapshot.
 	//! Otherwise, it is an id that is incremented whenever the schema changes (not stored between restarts)
@@ -318,6 +342,8 @@ public:
 	void RunCommitLoop(DuckLakeSnapshot transaction_snapshot, const TransactionChangeInformation &transaction_changes,
 	                   const DuckLakeRetryConfig &retry_config);
 	void ApplyServerSideCommit(idx_t schema_version);
+	//! Removes the files that this transaction wrote
+	void CleanupFiles();
 	//! Post-commit cleanup of empty inlined-data tables superseded by later schema versions.
 	void DropEmptySupersededInlinedTablesClientSide();
 	void ReportPostCommitError(const string &message);
@@ -333,6 +359,7 @@ public:
 
 private:
 	void FlushChanges();
+	void BeginMetadataTransaction();
 	void FlushNameMapCacheInvalidations();
 	//! Puts back the config options this transaction replaced in the catalog
 	void UndoConfigOptions();
@@ -358,12 +385,17 @@ private:
 	DatabaseInstance &db;
 	unique_ptr<DuckLakeMetadataManager> metadata_manager;
 	mutex connection_lock;
+	bool metadata_transaction_released = false;
 	unique_ptr<Connection> connection;
 	//! Flushes of several tables finalize in parallel while scans check the flushed tables
 	mutex flushed_inlined_lock;
+	//! The delete and insert actions of a MERGE finalize in parallel
+	mutex delete_attempted_lock;
 	//! The snapshots expired by this transaction, deleted when it commits
 	vector<DuckLakeSnapshotInfo> expired_snapshots;
-	//! The snapshot of the transaction (latest snapshot in DuckLake)
+	DuckLakeSnapshot GetLatestSnapshot();
+	//! The latest snapshot in DuckLake when the transaction first looked, the snapshot of the transaction unless the
+	//! catalog is opened at a fixed snapshot
 	mutex snapshot_lock;
 	unique_ptr<DuckLakeSnapshot> snapshot;
 	idx_t local_catalog_id;

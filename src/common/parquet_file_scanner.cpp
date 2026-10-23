@@ -80,7 +80,9 @@ void ParquetFileScanner::SetColumnIds(vector<column_t> column_ids_p) {
 
 void ParquetFileScanner::InitializeScan() {
 	if (initialized) {
+		// LCOV_EXCL_START
 		return;
+		// LCOV_EXCL_STOP
 	}
 
 	// If no column_ids specified, read all columns

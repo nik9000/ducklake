@@ -4,6 +4,7 @@
 #include "duckdb/common/array.hpp"
 #include "duckdb/common/optional_idx.hpp"
 #include "duckdb/common/type_visitor.hpp"
+#include "duckdb/parser/expression/type_expression.hpp"
 #include "storage/ducklake_metadata_info.hpp"
 
 namespace duckdb {
@@ -87,6 +88,30 @@ bool DuckLakeTypes::IsNested(const LogicalType &type) {
 	return type.IsNested() && type.id() != LogicalTypeId::VARIANT;
 }
 
+static LogicalType BindDuckLakeTypes(const LogicalType &type) {
+	return TypeVisitor::VisitReplace(type, [](const LogicalType &child) {
+		if (child.id() != LogicalTypeId::UNBOUND) {
+			return child;
+		}
+		auto &type_expr = UnboundType::GetTypeExpression(child)->Cast<TypeExpression>();
+		return DuckLakeTypes::FromString(type_expr.GetTypeName().GetIdentifierName());
+	});
+}
+
+LogicalType DuckLakeTypes::FromDuckDBString(const string &type) {
+	return BindDuckLakeTypes(UnboundType::TryParseAndDefaultBind(type));
+}
+
+LogicalType DuckLakeTypes::FromDuckDBString(const string &type, ClientContext &context) {
+	try {
+		// the Parquet reader creates types like JSON without their extension, so bind them without the catalog
+		return FromDuckDBString(type);
+	} catch (InvalidInputException &) {
+		// types like GEOMETRY with a coordinate system need the client context
+		return BindDuckLakeTypes(TransformStringToLogicalType(type, context));
+	}
+}
+
 LogicalType DuckLakeTypes::FromString(const string &type) {
 	if (StringUtil::StartsWith(type, "decimal(") && StringUtil::EndsWith(type, ")")) {
 		// decimal - parse width/scale
@@ -135,12 +160,6 @@ string DuckLakeTypes::ToString(const LogicalType &type) {
 		if (type.IsJSONType()) {
 			return "json";
 		}
-		if (type.id() == LogicalTypeId::UNBOUND) {
-			const auto type_name = type.GetAlias();
-			if (StringUtil::CIEquals(type_name, "json")) {
-				return "json";
-			}
-		}
 		throw InvalidInputException("Unsupported user-defined type");
 	}
 	switch (type.id()) {
@@ -171,7 +190,7 @@ string DuckLakeTypes::ToString(const LogicalType &type) {
 
 void DuckLakeTypes::CheckSupportedType(const LogicalType &type, DuckLakeVersion version) {
 	TypeVisitor::VisitReplace(type, [version](const LogicalType &type) {
-		if (type.id() == LogicalTypeId::SQLNULL && version < DuckLakeVersion::V1_1_DEV_1) {
+		if (type.id() == LogicalTypeId::SQLNULL && version < DuckLakeVersion::V1_1) {
 			ThrowUnsupportedByVersion(version, "the NULL type");
 		}
 		DuckLakeTypes::ToString(type);

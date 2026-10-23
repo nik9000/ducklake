@@ -196,7 +196,7 @@ FROM file_sorts('merged')
 ----
 current
 
-# rewriting files with deletes does not keep the sorted order, so it records none
+# rewriting files with deletes keeps the sorted order
 statement ok
 DELETE FROM ducklake.merged WHERE i % 2 = 0
 
@@ -206,7 +206,7 @@ CALL ducklake_rewrite_data_files('ducklake', 'merged', delete_threshold := 0)
 query I
 FROM file_sorts('merged')
 ----
-none
+current
 
 # flushed inlined data records none
 statement ok

@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from catalog import DuckDBCatalog, PostgresCatalog, expand, render, render_root
+from catalog import DuckDBCatalog, PostgresCatalog, SQLiteCatalog, create_catalog, expand, render, render_root
 
 
 class CatalogOperationTest(unittest.TestCase):
@@ -27,6 +27,36 @@ class CatalogOperationTest(unittest.TestCase):
         self.assertIn("TO '${BENCHMARK_DIR}/warm.db' (FORMAT blob);", expand(catalog, "create", "warm"))
         self.assertEqual(expand(catalog, "seal", "warm"), [])
         self.assertEqual(expand(catalog, "rollback", "${lake}_pristine TO ${work}"), ["ROLLBACK;"])
+
+    def test_sqlite_operations(self):
+        catalog = create_catalog("sqlite", "unused")
+        self.assertIsInstance(catalog, SQLiteCatalog)
+        self.assertEqual(catalog.header(), ["require sqlite_scanner", ""])
+        self.assertEqual(
+            expand(catalog, "attach", "IF NOT EXISTS ${work} AS lake (READ_ONLY)"),
+            ["ATTACH IF NOT EXISTS 'ducklake:sqlite:${BENCHMARK_DIR}/${work}.db' AS lake (READ_ONLY);"],
+        )
+        self.assertEqual(
+            expand(catalog, "create", "warm"),
+            [
+                "COPY (SELECT ''::BLOB AS content) TO '${BENCHMARK_DIR}/warm.db-journal' (FORMAT blob);",
+                "COPY (SELECT ''::BLOB AS content) TO '${BENCHMARK_DIR}/warm.db-wal' (FORMAT blob);",
+                "COPY (SELECT ''::BLOB AS content) TO '${BENCHMARK_DIR}/warm.db-shm' (FORMAT blob);",
+                "COPY (SELECT ''::BLOB AS content) TO '${BENCHMARK_DIR}/warm.db' (FORMAT blob);",
+            ],
+        )
+        self.assertEqual(
+            expand(catalog, "copy", "seed TO work"),
+            [
+                "COPY (SELECT ''::BLOB AS content) TO '${BENCHMARK_DIR}/work.db-journal' (FORMAT blob);",
+                "COPY (SELECT ''::BLOB AS content) TO '${BENCHMARK_DIR}/work.db-wal' (FORMAT blob);",
+                "COPY (SELECT ''::BLOB AS content) TO '${BENCHMARK_DIR}/work.db-shm' (FORMAT blob);",
+                "COPY (SELECT content FROM read_blob('${BENCHMARK_DIR}/seed.db'))",
+                "TO '${BENCHMARK_DIR}/work.db' (FORMAT blob);",
+            ],
+        )
+        self.assertEqual(expand(catalog, "seal", "warm"), [])
+        self.assertEqual(expand(catalog, "rollback", "seed TO work"), ["ROLLBACK;"])
 
     def test_postgres_operations(self):
         catalog = PostgresCatalog("bench")
@@ -65,6 +95,47 @@ class CatalogOperationTest(unittest.TestCase):
         for line in ("@restore lake", "@copy a b", "@attach a", "@create a'b", "@", "ATTACH 'ducklake:x.db' AS lake;"):
             with self.subTest(line=line), self.assertRaisesRegex(ValueError, r"^x\.benchmark:2: "):
                 render("x.benchmark", "load\n" + line + "\n", catalog, False)
+
+
+class BlockTest(unittest.TestCase):
+    def test_loops_and_conditions_repeat_their_lines_and_operations(self):
+        text = """load
+BEGIN;
+@for k in range(2)
+  @for j in range(k, 3)
+    @if (k + j) % 2 == 0 and not j == 2
+INSERT INTO lake.t_@{k * 10 + j} SELECT @{j} + i FROM range(${rows}) t(i);
+    @end
+  @end
+@create s@{k}
+COMMIT; BEGIN;
+@end
+COMMIT;
+"""
+        lines = render("x.benchmark", text, PostgresCatalog("bench"), False).splitlines()
+        self.assertEqual(lines[:3], ["load", "BEGIN;", "INSERT INTO lake.t_0 SELECT 0 + i FROM range(${rows}) t(i);"])
+        self.assertEqual(lines[3:6], expand(PostgresCatalog("bench"), "create", "s0"))
+        self.assertEqual(lines[6:8], ["COMMIT; BEGIN;", "INSERT INTO lake.t_11 SELECT 1 + i FROM range(${rows}) t(i);"])
+        self.assertEqual(lines[8:], expand(PostgresCatalog("bench"), "create", "s1") + ["COMMIT; BEGIN;", "COMMIT;"])
+
+    def test_invalid_blocks(self):
+        cases = [
+            ("@end", 2, "bare @end"),
+            ("@for k in range(2)\nSELECT 1;", 2, "without @end"),
+            ("@if 1\nSELECT 1;\n@end;", 4, "bare @end"),
+            ("@for k range(2)\n@end", 2, "expected @for NAME in range"),
+            ("@for k in range(1, 2, 3, 4)\n@end", 2, "range expected at most 3 arguments"),
+            ("@for k in range(${rows})\n@end", 2, "invalid expression"),
+            ("@if j\n@end", 2, "unknown loop variable j"),
+            ("@if 1 // 0\n@end", 2, "by zero"),
+            ("@if __import__('os')\n@end", 2, "invalid expression"),
+            ("SELECT @{k};", 2, "unknown loop variable k"),
+            ("@for k in range(1)\nSELECT @{(k).real};\n@end", 3, "invalid expression"),
+            ("@while 1", 2, "unknown catalog operation @while"),
+        ]
+        for text, line, message in cases:
+            with self.subTest(text=text), self.assertRaisesRegex(ValueError, rf"^x\.benchmark:{line}: .*{message}"):
+                render("x.benchmark", "load\n" + text + "\n", DuckDBCatalog(), False)
 
 
 class RenderRootTest(unittest.TestCase):

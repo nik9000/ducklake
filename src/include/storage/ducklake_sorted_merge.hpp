@@ -399,10 +399,11 @@ private:
 };
 
 //! A logical operator emitting the rows of files that are each sorted on the table's sort key, in merged order: the
-//! table's physical columns, then each row's snapshot id when write_snapshot_id is set. Its column bindings use
+//! table's physical columns, then each row's row id and snapshot id when write_row_id_and_snapshot_id is set. Its
+//! column bindings use
 //! table_index. estimated_rows is the rows of the files, which decides how the merge is scheduled.
 unique_ptr<LogicalOperator> PlanDuckLakeSortedMerge(DuckLakeTableEntry &table, vector<DuckLakeFileListEntry> files,
                                                     TableIndex table_index, idx_t row_group_size,
-                                                    bool write_snapshot_id, idx_t estimated_rows);
+                                                    bool write_row_id_and_snapshot_id, idx_t estimated_rows);
 
 } // namespace duckdb

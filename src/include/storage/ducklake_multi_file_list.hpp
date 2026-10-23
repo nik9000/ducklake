@@ -44,11 +44,16 @@ public:
 	vector<DuckLakeFileListExtendedEntry> GetFilesExtended() const;
 	const vector<DuckLakeFileListEntry> &GetFiles() const;
 	const DuckLakeFileListEntry &GetFileEntry(idx_t file_idx) const;
+	//! Set the columns a scan reads, before its file list is read
+	void SetScanColumns(const vector<MultiFileColumnDefinition> &global_columns,
+	                    const vector<ColumnIndex> &column_ids) const;
 	optional_ptr<const FilterPushdownInfo> GetFilterInfo() const {
 		return filter_info.get();
 	}
 
 	bool CanUseGlobalStats() const;
+	//! Whether filters can prune files by their stats
+	bool SupportsFilterPushdown() const;
 	bool IsDeleteScan() const;
 	const DuckLakeDeleteScanEntry &GetDeleteScanEntry(idx_t file_idx);
 	static DuckLakeFileData GetDeleteData(const DuckLakeDataFile &file);
@@ -59,7 +64,12 @@ protected:
 	OpenFileInfo GetFile(idx_t i) const override;
 
 private:
+	void ApplyLocalChanges(DuckLakeTransaction &transaction) const;
 	void GetFilesForTable() const;
+	//! Read the committed files, and the committed inlined rows before them when each metadata query commits
+	vector<DuckLakeFileListEntry>
+	ReadCommittedFiles(DuckLakeTransaction &transaction,
+	                   unordered_map<string, shared_ptr<DuckLakeCommittedInlinedRows>> &inlined_rows) const;
 	void GetTableInsertions() const;
 	void GetTableDeletions() const;
 	void AddInlinedDataTables(DuckLakeTransaction &transaction) const;
@@ -101,8 +111,6 @@ private:
 	//! A tree is not a promise that it prunes - that is decided when the SQL is generated.
 	unique_ptr<DuckLakeFilterNode> BuildFilterTree(ClientContext &context, MultiFilePushdownInfo &info,
 	                                               const Expression &expr, FilterTreeState &state) const;
-	//! Get the row_id_start for transaction-local inlined data.
-	idx_t GetTransactionLocalRowIdStart(idx_t transaction_row_start) const;
 
 private:
 	mutable mutex file_lock;
@@ -116,6 +124,8 @@ private:
 	shared_ptr<DuckLakeInlinedData> transaction_local_data;
 	//! Inlined data tables
 	mutable vector<DuckLakeInlinedTableInfo> inlined_data_tables;
+	//! The field ids a scan reads, set before its file list is read, with the snapshot id column under its own id
+	mutable unique_ptr<unordered_set<int32_t>> scan_field_ids;
 	//! The set of delete scans, only used when scanning deleted tuples using ducklake_table_deletions
 	mutable vector<DuckLakeDeleteScanEntry> delete_scans;
 	//! Filter pushdown information

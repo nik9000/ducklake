@@ -1,6 +1,7 @@
 #include "storage/ducklake_server_side_commit.hpp"
 
 #include "common/ducklake_row_helpers.hpp"
+#include "common/ducklake_util.hpp"
 #include "common/ducklake_types.hpp"
 #include "common/ducklake_version.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -258,6 +259,8 @@ void DuckLakeServerSideCommit::ReadStagedDataFiles() {
 
 	map<TableIndex, vector<DuckLakeDataFile>> files_per_table;
 	auto files_result = ScanStagedTable(DuckLakeStagedTableType::DATA_FILE);
+	bool has_created_by_ducklake = DuckLakeMetadataManager::ResultHasColumn(*files_result, "created_by_ducklake");
+	bool has_sort_id = DuckLakeMetadataManager::ResultHasColumn(*files_result, "sort_id");
 	for (auto &row : *files_result) {
 		DataFileIndex local_file_id(AsIdx(row, 0));
 		DuckLakeDataFile f;
@@ -274,7 +277,11 @@ void DuckLakeServerSideCommit::ReadStagedDataFiles() {
 		f.max_partial_file_snapshot = OptIdx(row, 13);
 		f.begin_snapshot = OptIdx(row, 14);
 		f.row_group_count = OptIdx(row, 16);
-		f.sort_id = OptIdx(row, 17);
+		// staged tables from older clients lack the column, and only an added file has a name map
+		f.created_by_ducklake = has_created_by_ducklake ? row.GetValue<bool>(17) : !f.mapping_id.IsValid();
+		if (has_sort_id) {
+			f.sort_id = OptIdx(row, 18);
+		}
 		TakeIfPresent(per_file_stats, local_file_id, f.column_stats);
 		TakeIfPresent(attached_deletes, local_file_id.index, f.delete_files);
 		TakeIfPresent(partition_values_by_file, local_file_id.index, f.partition_values);
@@ -545,7 +552,7 @@ bool DuckLakeServerSideCommit::ReadSupportsV1_1Metadata() {
 	                                 "{METADATA_CATALOG}", schema_id);
 	auto result = RunQuery(sql, "read catalog version");
 	for (auto &row : *result) {
-		return DuckLakeVersionFromString(row.GetValue<string>(0)) >= DuckLakeVersion::V1_1_DEV_1;
+		return DuckLakeVersionFromString(row.GetValue<string>(0)) >= DuckLakeVersion::V1_1;
 	}
 	return false;
 }
@@ -631,6 +638,7 @@ DuckLakeCommitContext DuckLakeServerSideCommit::BuildContext(idx_t &committed_sn
 	ctx.commit_info = state->commit_info;
 	ctx.skip_drop_empty_inlined = true;
 	ctx.supports_v1_1_metadata = supports_v1_1_metadata;
+	ctx.snapshot_and_stats_query = DuckLakeMetadataManager::SnapshotAndStatsAndChangesQuery(supports_v1_1_metadata);
 	ctx.conflict_query_executor = [this](string q) -> unique_ptr<QueryResult> {
 		auto sql = SubstitutePlaceholders(std::move(q), transaction_snapshot);
 		return fresh_conn.Query(sql);
@@ -703,26 +711,15 @@ DuckLakeCommitContext DuckLakeServerSideCommit::BuildContext(idx_t &committed_sn
 			inlined_deletion_table = DuckLakeMetadataManager::InlinedFileDeletionTableName(table_id);
 		}
 		auto sql = SubstitutePlaceholders(
-		    DuckLakeMetadataManager::GetNetDataFileRowCountSql(table_id, inlined_deletion_table), transaction_snapshot);
+		    DuckLakeMetadataManager::GetNetDataFileRowCountSql(table_id, inlined_deletion_table, false, true),
+		    transaction_snapshot);
 		auto result = RunQuery(sql, "read net data file row count");
 		for (auto &row : *result) {
 			return row.GetValue<idx_t>(0);
 		}
+		// LCOV_EXCL_START
 		return 0;
-	};
-	auto inlined_col_names = ctx.InlinedColNames();
-	ctx.get_net_inlined_row_count = [this, inlined_col_names](TableIndex table_id) -> idx_t {
-		idx_t total = 0;
-		for (auto &name : LookupInlinedTableNames(table_id)) {
-			auto sql = SubstitutePlaceholders(
-			    DuckLakeMetadataManager::GetNetInlinedRowCountSql(name, inlined_col_names), transaction_snapshot);
-			auto result = RunQuery(sql, "read net inlined row count");
-			for (auto &row : *result) {
-				total += row.GetValue<idx_t>(0);
-				break;
-			}
-		}
-		return total;
+		// LCOV_EXCL_STOP
 	};
 	ctx.set_catalog_version = [&committed_schema_version](idx_t v) {
 		committed_schema_version = v;
@@ -740,9 +737,10 @@ bool DuckLakeServerSideCommit::InlinedFileDeletionTableExists(TableIndex table_i
 }
 
 string DuckLakeServerSideCommit::SubstitutePlaceholders(string sql, const DuckLakeSnapshot &snapshot) const {
-	sql = StringUtil::Replace(sql, "{METADATA_CATALOG}", schema_id);
-	sql = StringUtil::Replace(sql, "{METADATA_CATALOG_NAME_LITERAL}", "(SELECT current_database())");
-	sql = StringUtil::Replace(sql, "{METADATA_SCHEMA_NAME_LITERAL}", SQLString::ToString(metadata_schema_name));
+	sql = DuckLakeUtil::ReplacePlaceholders(
+	    sql, {{"{METADATA_CATALOG}", schema_id},
+	          {"{METADATA_CATALOG_NAME_LITERAL}", "(SELECT current_database())"},
+	          {"{METADATA_SCHEMA_NAME_LITERAL}", SQLString::ToString(metadata_schema_name)}});
 	DuckLakeMetadataManager::SubstituteSnapshotPlaceholders(snapshot, sql);
 	return sql;
 }
@@ -756,8 +754,11 @@ unique_ptr<QueryResult> DuckLakeServerSideCommit::RunQuery(const string &query, 
 unique_ptr<QueryResult> DuckLakeServerSideCommit::ScanStagedTable(DuckLakeStagedTableType kind) {
 	string table_name = DuckLakeStagedTable::BaseName(kind);
 	auto &temp_catalog = Catalog::GetCatalog(context, TEMP_CATALOG);
-	auto &table_entry = temp_catalog.GetEntry<TableCatalogEntry>(context, DEFAULT_SCHEMA, Identifier(table_name))
-	                        .Cast<DuckTableEntry>();
+	auto &table_entry =
+	    temp_catalog
+	        .GetEntry<TableCatalogEntry>(
+	            context, QualifiedName(temp_catalog.GetName(), Identifier(DEFAULT_SCHEMA), Identifier(table_name)))
+	        .Cast<DuckTableEntry>();
 	auto &storage = table_entry.GetStorage();
 
 	auto types = storage.GetTypes();

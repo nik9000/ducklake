@@ -16,6 +16,7 @@
 #include "storage/ducklake_catalog.hpp"
 #include "storage/ducklake_multi_file_reader.hpp"
 #include "storage/ducklake_multisequence_select.hpp"
+#include "storage/ducklake_schema_entry.hpp"
 #include "storage/ducklake_sorted_merge.hpp"
 #include "storage/ducklake_table_entry.hpp"
 #include "storage/ducklake_transaction.hpp"
@@ -171,8 +172,8 @@ struct SortedMergeBindData {
 	idx_t row_group_size;
 	//! Decoded bytes per decode unit, derived from the memory limit when not set
 	optional_idx decode_unit_size;
-	//! Whether each row's snapshot id follows the table's columns, as compaction writes it
-	bool write_snapshot_id = false;
+	//! Whether each row's row id and snapshot id follow the table's columns, as compaction writes them
+	bool write_row_id_and_snapshot_id = false;
 	//! The rows of the files, from the catalog
 	idx_t estimated_rows = 0;
 };
@@ -450,7 +451,7 @@ static unique_ptr<SortedMergeGlobalState> InitSortedMergeGlobal(ClientContext &c
 	auto keys_only = result->sequencer->DecodableColumns().size() == bind_data.table.GetColumns().PhysicalColumnCount();
 	auto segments_ahead = max_memory / (keys_only ? KEY_SEGMENT_MEMORY / 2 : KEY_SEGMENT_MEMORY);
 
-	result->has_payload = !keys_only || bind_data.write_snapshot_id;
+	result->has_payload = !keys_only || bind_data.write_row_id_and_snapshot_id;
 	result->sequencer->SetMaxSegmentsAhead(segments_ahead < 2 * input_count ? input_count : segments_ahead);
 	idx_t file_bytes = 0;
 	idx_t file_rows = 0;
@@ -467,7 +468,9 @@ static unique_ptr<SortedMergeGlobalState> InitSortedMergeGlobal(ClientContext &c
 	result->file_row_group_rows = DEFAULT_ROW_GROUP_SIZE;
 	auto &catalog = bind_data.table.ParentCatalog().Cast<DuckLakeCatalog>();
 	string row_group_size_setting;
-	if (catalog.TryGetConfigOption("parquet_row_group_size", row_group_size_setting, bind_data.table)) {
+	auto schema_id = bind_data.table.ParentSchema().Cast<DuckLakeSchemaEntry>().GetSchemaId();
+	if (catalog.TryGetConfigOption("parquet_row_group_size", row_group_size_setting, schema_id,
+	                               bind_data.table.GetTableId())) {
 		result->file_row_group_rows = Value(row_group_size_setting).GetValue<idx_t>();
 	}
 	result->key_column_share = double(MaxValue<idx_t>(result->sequencer->DecodableColumns().size(), 1)) /
@@ -525,12 +528,13 @@ InitSortedMergeLocal(ClientContext &context, const SortedMergeBindData &bind_dat
 		}
 		column_idx++;
 	}
-	if (bind_data.write_snapshot_id) {
-		auto snapshot_id_column = DuckLakeMultiFileReader::COLUMN_IDENTIFIER_SNAPSHOT_ID;
-		result->payload_columns.push_back(result->payload_types.size());
-		result->payload_types.push_back(bind_data.table.GetVirtualColumns().at(snapshot_id_column).type);
-		result->payload_scan_columns.push_back(snapshot_id_column);
-		result->payload_output_columns.push_back(column_idx);
+	if (bind_data.write_row_id_and_snapshot_id) {
+		for (auto virtual_column : {COLUMN_IDENTIFIER_ROW_ID, DuckLakeMultiFileReader::COLUMN_IDENTIFIER_SNAPSHOT_ID}) {
+			result->payload_columns.push_back(result->payload_types.size());
+			result->payload_types.push_back(bind_data.table.GetVirtualColumns().at(virtual_column).type);
+			result->payload_scan_columns.push_back(virtual_column);
+			result->payload_output_columns.push_back(column_idx++);
+		}
 	}
 	if (!result->payload_types.empty()) {
 		result->staging.Initialize(Allocator::DefaultAllocator(), result->payload_types);
@@ -1306,19 +1310,20 @@ static unique_ptr<LogicalOperator> DuckLakeSortedMergeBind(ClientContext &contex
 
 unique_ptr<LogicalOperator> PlanDuckLakeSortedMerge(DuckLakeTableEntry &table, vector<DuckLakeFileListEntry> files,
                                                     TableIndex table_index, idx_t row_group_size,
-                                                    bool write_snapshot_id, idx_t estimated_rows) {
+                                                    bool write_row_id_and_snapshot_id, idx_t estimated_rows) {
 	vector<LogicalType> return_types;
 	for (auto &column : table.GetColumns().Physical()) {
 		return_types.push_back(column.Type());
 	}
-	if (write_snapshot_id) {
-		return_types.push_back(
-		    table.GetVirtualColumns().at(DuckLakeMultiFileReader::COLUMN_IDENTIFIER_SNAPSHOT_ID).type);
+	if (write_row_id_and_snapshot_id) {
+		for (auto virtual_column : {COLUMN_IDENTIFIER_ROW_ID, DuckLakeMultiFileReader::COLUMN_IDENTIFIER_SNAPSHOT_ID}) {
+			return_types.push_back(table.GetVirtualColumns().at(virtual_column).type);
+		}
 	}
 	auto bind_data = make_shared_ptr<SortedMergeBindData>(table);
 	bind_data->files = std::move(files);
 	bind_data->row_group_size = row_group_size;
-	bind_data->write_snapshot_id = write_snapshot_id;
+	bind_data->write_row_id_and_snapshot_id = write_row_id_and_snapshot_id;
 	bind_data->estimated_rows = estimated_rows;
 	return make_uniq<DuckLakeLogicalSortedMerge>(table_index, std::move(bind_data), std::move(return_types));
 }
@@ -1409,7 +1414,7 @@ static unique_ptr<FunctionData> DuckLakeSortedMergeWorkerLimitsBind(ClientContex
 			throw BinderException("ducklake_sorted_merge_worker_limits does not accept NULL arguments");
 		}
 	}
-	auto max_memory = DBConfig::ParseMemoryLimit(StringValue::Get(input.inputs[0]));
+	auto max_memory = DBConfig::ParseMemoryLimitOrMaximum(StringValue::Get(input.inputs[0]));
 	auto threads = input.inputs[1].GetValue<int64_t>();
 	if (threads <= 0) {
 		throw BinderException("threads must be positive");

@@ -51,16 +51,11 @@ public:
 	CompactionType type;
 	//! The sort the written files are sorted by (if any)
 	optional_idx sort_id;
+	//! Whether the rows reach the rotating copy in the order they must be written in
+	bool ordered_input = false;
 
 public:
-	PhysicalOperator &CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) override {
-		auto &child = planner.CreatePlan(*children[0]);
-		auto &compaction =
-		    planner.Make<DuckLakeCompaction>(types, table, std::move(source_files), std::move(encryption_key),
-		                                     partition_id, std::move(partition_values), row_id_start, child, type);
-		compaction.Cast<DuckLakeCompaction>().sort_id = sort_id;
-		return compaction;
-	}
+	PhysicalOperator &CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) override;
 
 	string GetName() const override {
 		return "DUCKLAKE_COMPACTION";
@@ -94,25 +89,27 @@ public:
 	void GenerateCompactions(DuckLakeTableEntry &table, vector<unique_ptr<LogicalOperator>> &compactions);
 	unique_ptr<LogicalOperator> GenerateCompactionCommand(vector<DuckLakeCompactionFileEntry> source_files,
 	                                                      bool bind_to_latest_schema = false);
+	//! Sort the scan of a schema version of the table by the sort of its latest version
 	static unique_ptr<LogicalOperator> InsertSort(Binder &binder, unique_ptr<LogicalOperator> &plan,
-	                                              DuckLakeTableEntry &table, optional_ptr<DuckLakeSort> sort_data);
+	                                              DuckLakeTableEntry &table, const DuckLakeTableEntry &latest_table,
+	                                              optional_ptr<DuckLakeSort> sort_data);
 	static vector<OrderByNode> ParseSortOrders(const DuckLakeSort &sort_data);
 	//! Bind ORDER BY expressions against a column list + table name (works before a table entry exists).
-	static vector<BoundOrderByNode> BindSortOrders(Binder &binder, const ColumnList &columns,
-	                                               const Identifier &table_name, TableIndex table_index,
-	                                               const vector<OrderByNode> &pre_bound_orders);
+	static vector<BoundOrderByNode> BindSortOrders(Binder &binder, SchemaCatalogEntry &schema,
+	                                               const ColumnList &columns, const Identifier &table_name,
+	                                               TableIndex table_index, const vector<OrderByNode> &pre_bound_orders);
 	static DuckLakeTableEntry &GetLatestTableEntry(DuckLakeCatalog &catalog, DuckLakeTransaction &transaction,
 	                                               const DuckLakeTableEntry &table);
 	static unique_ptr<LogicalOperator>
 	PlanRewriteScan(ClientContext &context, Binder &binder, DuckLakeTableEntry &table, DuckLakeCopyInput &copy_input,
-	                bool write_row_id, bool write_snapshot_id,
+	                bool write_snapshot_id,
 	                const std::function<unique_ptr<DuckLakeMultiFileList>(DuckLakeFunctionInfo &)> &create_file_list,
 	                unique_ptr<LogicalCopyToFile> &copy);
 
 private:
 	//! Whether the files are all sorted on the table's sort, so compacting them can merge instead of sort
 	bool CanMergeSorted(DuckLakeTableEntry &table, const vector<DuckLakeCompactionFileEntry> &files,
-	                    optional_idx sort_id, bool write_row_id);
+	                    optional_idx sort_id);
 
 	optional_ptr<DuckLakeTableEntry> ResolvePartitionSpecTable(DuckLakeTableEntry &table,
 	                                                           const DuckLakeCompactionFileEntry &source_file,

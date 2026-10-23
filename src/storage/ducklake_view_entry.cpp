@@ -19,12 +19,14 @@ DuckLakeViewEntry::DuckLakeViewEntry(Catalog &catalog, SchemaCatalogEntry &schem
                                      TableIndex view_id, string view_uuid_p, string query_sql_p,
                                      LocalChange local_change)
     : ViewCatalogEntry(catalog, schema, info), view_id(view_id), view_uuid(std::move(view_uuid_p)),
-      query_sql(std::move(query_sql_p)), local_change(local_change) {
+      query_sql(std::move(query_sql_p)), local_change(local_change),
+      has_column_comments(!info.column_comments_map.empty()) {
 }
 
 DuckLakeViewEntry::DuckLakeViewEntry(DuckLakeViewEntry &parent, CreateViewInfo &info, LocalChange local_change)
     : DuckLakeViewEntry(parent.catalog, parent.schema, info, parent.GetViewId(), parent.GetViewUUID(), parent.query_sql,
                         local_change) {
+	oid = parent.oid;
 }
 
 unique_ptr<CatalogEntry> DuckLakeViewEntry::AlterEntry(ClientContext &context, AlterInfo &info) {
@@ -83,8 +85,10 @@ unique_ptr<CreateInfo> DuckLakeViewEntry::GetInfo() const {
 }
 
 string DuckLakeViewEntry::ToSQL() const {
+	auto qualified_name = schema.GetQualifiedName(name);
+	qualified_name.StripCatalog();
 	string result = "CREATE VIEW ";
-	result += SQLIdentifier::ToString(name.GetIdentifierName());
+	result += qualified_name.ToString(QualifiedNameToStringMode::HIDE_DEFAULT_SCHEMA);
 	if (!aliases.empty()) {
 		result += " (";
 		result += StringUtil::Join(aliases, aliases.size(), ", ", [](const Identifier &alias) {
@@ -99,6 +103,7 @@ string DuckLakeViewEntry::ToSQL() const {
 	return result;
 }
 
+// LCOV_EXCL_START
 unique_ptr<CatalogEntry> DuckLakeViewEntry::Copy(ClientContext &context) const {
 	D_ASSERT(!internal);
 	auto create_info = GetInfo();
@@ -106,6 +111,7 @@ unique_ptr<CatalogEntry> DuckLakeViewEntry::Copy(ClientContext &context) const {
 	return make_uniq<DuckLakeViewEntry>(catalog, schema, create_info->Cast<CreateViewInfo>(), view_id, view_uuid,
 	                                    query_sql, local_change);
 }
+// LCOV_EXCL_STOP
 
 unique_ptr<SelectStatement> DuckLakeViewEntry::ParseSelectStatement() const {
 	auto parser = Parser::GetBuiltinParser();

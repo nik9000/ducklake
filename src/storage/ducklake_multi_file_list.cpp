@@ -2,6 +2,7 @@
 #include "storage/ducklake_scan.hpp"
 #include "storage/ducklake_multi_file_list.hpp"
 #include "storage/ducklake_multi_file_reader.hpp"
+#include "storage/ducklake_inlined_data_reader.hpp"
 #include "storage/ducklake_metadata_manager.hpp"
 
 #include "duckdb/common/algorithm.hpp"
@@ -65,11 +66,15 @@ optional_ptr<const DuckLakeFieldId> DuckLakeMultiFileList::ResolveFilterField(co
 	optional_ptr<const DuckLakeFieldId> field_id = read_info.table.GetFieldId(PhysicalIndex(column_id));
 	for (auto &entry : path) {
 		if (entry.child_name.empty()) {
+			// LCOV_EXCL_START
 			return nullptr;
+			// LCOV_EXCL_STOP
 		}
 		field_id = field_id->GetChildByName(entry.child_name.GetIdentifierName());
 		if (!field_id) {
+			// LCOV_EXCL_START
 			return nullptr;
+			// LCOV_EXCL_STOP
 		}
 	}
 	return field_id;
@@ -121,7 +126,9 @@ unique_ptr<DuckLakeFilterNode> DuckLakeMultiFileList::GetFilterNode(column_t col
 	const auto &column_type = read_info.column_types[column_index.index];
 	auto expr_filter = ExpressionFilter::FromTableFilter(*filter, column_type);
 	if (!expr_filter->expr) {
+		// LCOV_EXCL_START
 		return nullptr;
+		// LCOV_EXCL_STOP
 	}
 	return GetColumnFilterNode(column_id, *expr_filter->expr, column_type);
 }
@@ -141,11 +148,15 @@ unique_ptr<DuckLakeFilterNode> DuckLakeMultiFileList::GetExpressionFilterNode(Mu
 	auto &binding = root.Cast<BoundColumnRefExpression>().Binding();
 	if (binding.table_index != info.table_index) {
 		// a reference to a different table tells us nothing about this one
+		// LCOV_EXCL_START
 		return nullptr;
+		// LCOV_EXCL_STOP
 	}
 	auto projection_index = binding.column_index;
 	if (projection_index >= info.column_ids.size()) {
+		// LCOV_EXCL_START
 		return nullptr;
+		// LCOV_EXCL_STOP
 	}
 	auto column_id = info.column_ids[projection_index];
 	auto field_id = ResolveFilterField(*subject, column_id);
@@ -176,7 +187,9 @@ void DuckLakeMultiFileList::AddFilterNodeToPushdownInfo(FilterPushdownInfo &push
 		return;
 	}
 	if (node.type != DuckLakeFilterNodeType::COLUMN_FILTER) {
+		// LCOV_EXCL_START
 		return;
+		// LCOV_EXCL_STOP
 	}
 	auto &column_filter = *node.column_filter;
 	auto entry = pushdown_info.column_filters.find(column_filter.column_field_index);
@@ -198,8 +211,7 @@ DuckLakeMultiFileList::DynamicFilterPushdown(MultiFileDynamicPushdownInfo &dynam
 	auto &context = dynamic_pushdown_info.context;
 	auto &filters = dynamic_pushdown_info.filters;
 
-	if (read_info.scan_type != DuckLakeScanType::SCAN_TABLE || !filters.HasFilters()) {
-		// filter pushdown is only supported when scanning full tables
+	if (!SupportsFilterPushdown() || !filters.HasFilters()) {
 		return nullptr;
 	}
 
@@ -253,7 +265,9 @@ bool DuckLakeMultiFileList::FilterTreeState::VisitNode() {
 
 bool DuckLakeMultiFileList::FilterTreeState::AddLeaves(const DuckLakeFilterNode &node) {
 	if (exhausted) {
+		// LCOV_EXCL_START
 		return false;
+		// LCOV_EXCL_STOP
 	}
 	VisitFilterTreeLeaves(node, [&](const DuckLakeFilterNode &) { leaves++; });
 	if (leaves > MAX_LEAVES) {
@@ -347,7 +361,9 @@ unique_ptr<DuckLakeFilterNode> DuckLakeMultiFileList::BuildFilterTree(ClientCont
 		// the branches did not work out - the combiner may still express the disjunction on a single column
 		auto node = CombineFilterNode(context, info, expr);
 		if (node) {
+			// LCOV_EXCL_START
 			return state.AddLeaves(*node) ? std::move(node) : nullptr;
+			// LCOV_EXCL_STOP
 		}
 	}
 	// the combiner only expresses a subset of what we can evaluate against column stats
@@ -362,7 +378,7 @@ unique_ptr<MultiFileList> DuckLakeMultiFileList::ComplexFilterPushdown(ClientCon
                                                                        const MultiFileOptions &options,
                                                                        MultiFilePushdownInfo &info,
                                                                        vector<unique_ptr<Expression>> &filters) const {
-	if (read_info.scan_type != DuckLakeScanType::SCAN_TABLE || filters.empty()) {
+	if (!SupportsFilterPushdown() || filters.empty()) {
 		return nullptr;
 	}
 
@@ -406,7 +422,9 @@ unique_ptr<MultiFileList> DuckLakeMultiFileList::ComplexFilterPushdown(ClientCon
 		    *root, [&](const DuckLakeFilterNode &leaf) { columns.insert(leaf.column_filter->column_field_index); });
 		if (columns.size() < 2 && CombineFilterNode(context, info, *filter)) {
 			// the combiner reduced the whole disjunction to its one column, so it is already pushed down
+			// LCOV_EXCL_START
 			continue;
+			// LCOV_EXCL_STOP
 		}
 		DuckLakeFilterTree tree;
 		tree.root = std::move(root);
@@ -464,7 +482,9 @@ OpenFileInfo DuckLakeMultiFileList::GetFile(idx_t i) const {
 		}
 		extended_info->options["snapshot_id"] = Value(LogicalType::BIGINT);
 		if (file_entry.mapping_id.IsValid()) {
+			// LCOV_EXCL_START
 			extended_info->options["mapping_id"] = Value::UBIGINT(file_entry.mapping_id.index);
+			// LCOV_EXCL_STOP
 		}
 	} else if (i >= inlined_data_file_start) {
 		// scanning inlined data
@@ -497,7 +517,7 @@ OpenFileInfo DuckLakeMultiFileList::GetFile(idx_t i) const {
 		// etag / last modified time can be set to dummy values
 		extended_info->options["etag"] = Value("");
 		extended_info->options["last_modified"] = Value::TIMESTAMP(timestamp_t(0));
-		if (!file_entry.delete_file.path.empty() || file_entry.max_row_count.IsValid()) {
+		if (!file_entry.delete_file.path.empty()) {
 			extended_info->options["has_deletes"] = Value::BOOLEAN(true);
 		}
 		if (file_entry.mapping_id.IsValid()) {
@@ -554,6 +574,13 @@ DuckLakeFileData DuckLakeMultiFileList::GetDeleteData(const DuckLakeDeleteFile &
 	return result;
 }
 
+static void SetDeleteBeginSnapshot(DuckLakeFileListEntry &entry, optional_idx begin_snapshot) {
+}
+
+static void SetDeleteBeginSnapshot(DuckLakeFileListExtendedEntry &entry, optional_idx begin_snapshot) {
+	entry.delete_file_begin_snapshot = begin_snapshot;
+}
+
 template <class ENTRY>
 static void ApplyLocalFileChanges(DuckLakeTransaction &transaction, TableIndex table_id, vector<ENTRY> &entries) {
 	if (transaction.HasDroppedFiles()) {
@@ -564,13 +591,18 @@ static void ApplyLocalFileChanges(DuckLakeTransaction &transaction, TableIndex t
 	// if the transaction has any local deletes - apply them to the file list
 	if (transaction.HasLocalDeletes(table_id)) {
 		for (auto &file_entry : entries) {
-			transaction.GetLocalDeleteForFile(table_id, file_entry.file.path, file_entry.delete_file);
+			optional_idx begin_snapshot;
+			if (transaction.GetLocalDeleteForFile(table_id, file_entry.file.path, file_entry.delete_file,
+			                                      begin_snapshot)) {
+				SetDeleteBeginSnapshot(file_entry, begin_snapshot);
+			}
 		}
 	}
 }
 
 void DuckLakeMultiFileList::AddInlinedDataTables(DuckLakeTransaction &transaction) const {
-	inlined_data_tables = read_info.table.GetInlinedDataTables(transaction, read_info.snapshot);
+	inlined_data_tables =
+	    read_info.table.GetInlinedDataTables(transaction, read_info.snapshot, read_info.include_local_changes);
 	for (auto &table : inlined_data_tables) {
 		files.push_back(InlinedDataEntry(table));
 	}
@@ -593,6 +625,9 @@ vector<DuckLakeFileListExtendedEntry> DuckLakeMultiFileList::GetFilesExtended() 
 		file_entry.row_count = file.row_count;
 		file_entry.file = GetFileData(file);
 		file_entry.delete_file = GetDeleteData(file);
+		if (!file.delete_files.empty()) {
+			file_entry.delete_file_begin_snapshot = file.delete_files.back().begin_snapshot;
+		}
 		file_entry.row_id_start = transaction_row_start;
 		transaction_row_start += file.row_count;
 		result.push_back(std::move(file_entry));
@@ -611,23 +646,15 @@ vector<DuckLakeFileListExtendedEntry> DuckLakeMultiFileList::GetFilesExtended() 
 		DuckLakeFileListExtendedEntry file_entry;
 		file_entry.file.path = DUCKLAKE_TRANSACTION_LOCAL_INLINED_FILENAME;
 		file_entry.row_count = transaction_local_data->data->Count();
-		file_entry.row_id_start = GetTransactionLocalRowIdStart(transaction_row_start);
+		file_entry.row_id_start = transaction_row_start;
 		file_entry.data_type = DuckLakeDataType::TRANSACTION_LOCAL_INLINED_DATA;
 		result.push_back(std::move(file_entry));
 	}
 	return result;
 }
 
-void DuckLakeMultiFileList::GetFilesForTable() const {
-	auto transaction_ref = read_info.GetTransaction();
-	auto &transaction = *transaction_ref;
-	if (!IsTransactionLocal(read_info.table_id)) {
-		// not a transaction local table - read the file list from the metadata store
-		auto &metadata_manager = transaction.GetMetadataManager();
-		files = metadata_manager.GetFilesForTable(read_info.table, read_info.snapshot, filter_info.get());
-	}
+void DuckLakeMultiFileList::ApplyLocalChanges(DuckLakeTransaction &transaction) const {
 	ApplyLocalFileChanges(transaction, read_info.table_id, files);
-	// if the transaction has any local inlined file deletes - apply them to the file list
 	if (transaction.HasLocalInlinedFileDeletes(read_info.table_id)) {
 		for (auto &file_entry : files) {
 			if (file_entry.file_id.IsValid()) {
@@ -635,6 +662,90 @@ void DuckLakeMultiFileList::GetFilesForTable() const {
 				                                              file_entry.inlined_file_deletions);
 			}
 		}
+	}
+}
+
+void DuckLakeMultiFileList::SetScanColumns(const vector<MultiFileColumnDefinition> &global_columns,
+                                           const vector<ColumnIndex> &column_ids) const {
+	lock_guard<mutex> l(file_lock);
+	scan_field_ids = make_uniq<unordered_set<int32_t>>();
+	for (auto &column_id : column_ids) {
+		auto index = column_id.GetPrimaryIndex();
+		if (index == DuckLakeMultiFileReader::COLUMN_IDENTIFIER_SNAPSHOT_ID) {
+			scan_field_ids->insert(MultiFileReader::LAST_UPDATED_SEQUENCE_NUMBER_ID);
+		}
+		if (index >= global_columns.size()) {
+			continue;
+		}
+		auto &identifier = global_columns[index].identifier;
+		if (!identifier.IsNull() && identifier.type().id() == LogicalTypeId::INTEGER) {
+			scan_field_ids->insert(IntegerValue::Get(identifier));
+		}
+	}
+}
+
+vector<DuckLakeFileListEntry> DuckLakeMultiFileList::ReadCommittedFiles(
+    DuckLakeTransaction &transaction,
+    unordered_map<string, shared_ptr<DuckLakeCommittedInlinedRows>> &inlined_rows) const {
+	static constexpr idx_t MAX_ATTEMPTS = 10;
+	auto &metadata_manager = transaction.GetMetadataManager();
+	if (!metadata_manager.CommitsEachStatement() || inlined_data_tables.empty()) {
+		return metadata_manager.GetFilesForTable(read_info.table, read_info.snapshot, filter_info.get(),
+		                                         read_info.include_local_changes);
+	}
+	// every query sees the latest commits, so the inlined rows are read first and again if a file was written since
+	for (idx_t attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+		optional_idx next_file_id;
+		inlined_rows.clear();
+		if (attempt > 0) {
+			// the flush can have dropped an inlined table it emptied
+			inlined_data_tables =
+			    read_info.table.GetInlinedDataTables(transaction, read_info.snapshot, read_info.include_local_changes);
+		}
+		for (auto &table : inlined_data_tables) {
+			vector<MultiFileColumnDefinition> columns;
+			if (!DuckLakeMultiFileReader::GetInlinedTableColumns(read_info, table.schema_version, columns)) {
+				continue;
+			}
+			if (scan_field_ids) {
+				columns.erase(std::remove_if(columns.begin(), columns.end(),
+				                             [&](const MultiFileColumnDefinition &col) {
+					                             auto field_id = IntegerValue::Get(col.identifier);
+					                             return field_id != MultiFileReader::ROW_ID_FIELD_ID &&
+					                                    scan_field_ids->count(field_id) == 0;
+				                             }),
+				              columns.end());
+			}
+			inlined_rows[table.table_name] =
+			    DuckLakeInlinedDataReader::ReadCommittedRows(read_info, table.table_name, columns, next_file_id);
+		}
+		auto result = metadata_manager.GetFilesForTable(read_info.table, read_info.snapshot, filter_info.get(),
+		                                                read_info.include_local_changes);
+		// without inlined rows a flush cannot move any of them
+		bool written_since = next_file_id.IsValid() &&
+		                     std::any_of(result.begin(), result.end(), [&](const DuckLakeFileListEntry &entry) {
+			                     return entry.file_id.IsValid() && entry.file_id.index >= next_file_id.GetIndex();
+		                     });
+		if (!written_since) {
+			return result;
+		}
+	}
+	throw TransactionException("Transaction conflict - the inlined data of table \"%s\" kept moving to files while "
+	                           "it was read",
+	                           read_info.table.name.GetIdentifierName());
+}
+
+void DuckLakeMultiFileList::GetFilesForTable() const {
+	auto transaction_ref = read_info.GetTransaction();
+	auto &transaction = *transaction_ref;
+	inlined_data_tables =
+	    read_info.table.GetInlinedDataTables(transaction, read_info.snapshot, read_info.include_local_changes);
+	unordered_map<string, shared_ptr<DuckLakeCommittedInlinedRows>> inlined_rows;
+	if (!IsTransactionLocal(read_info.table_id)) {
+		files = ReadCommittedFiles(transaction, inlined_rows);
+	}
+	if (read_info.include_local_changes) {
+		ApplyLocalChanges(transaction);
 	}
 	idx_t transaction_row_start = DuckLakeConstants::TRANSACTION_LOCAL_ROW_ID_START;
 	for (auto &file : transaction_local_files) {
@@ -646,12 +757,19 @@ void DuckLakeMultiFileList::GetFilesForTable() const {
 		transaction_row_start += file.row_count;
 		files.emplace_back(std::move(file_entry));
 	}
-	AddInlinedDataTables(transaction);
+	for (auto &table : inlined_data_tables) {
+		auto file_entry = InlinedDataEntry(table);
+		auto rows = inlined_rows.find(table.table_name);
+		if (rows != inlined_rows.end()) {
+			file_entry.inlined_rows = rows->second;
+		}
+		files.push_back(std::move(file_entry));
+	}
 	if (transaction_local_data) {
 		// we have transaction local inlined data - create the dummy file entry
 		DuckLakeFileListEntry file_entry;
 		file_entry.file.path = DUCKLAKE_TRANSACTION_LOCAL_INLINED_FILENAME;
-		file_entry.row_id_start = GetTransactionLocalRowIdStart(transaction_row_start);
+		file_entry.row_id_start = transaction_row_start;
 		file_entry.data_type = DuckLakeDataType::TRANSACTION_LOCAL_INLINED_DATA;
 		files.push_back(std::move(file_entry));
 	}
@@ -675,7 +793,8 @@ void DuckLakeMultiFileList::GetTableDeletions() const {
 	auto transaction_ref = read_info.GetTransaction();
 	auto &transaction = *transaction_ref;
 	auto &metadata_manager = transaction.GetMetadataManager();
-	delete_scans = metadata_manager.GetTableDeletions(read_info.table, *read_info.start_snapshot, read_info.snapshot);
+	delete_scans = metadata_manager.GetTableDeletions(read_info.table, *read_info.start_snapshot, read_info.snapshot,
+	                                                  read_info.include_local_changes);
 	for (auto &file : delete_scans) {
 		DuckLakeFileListEntry file_entry;
 		file_entry.file = file.file;
@@ -689,6 +808,11 @@ void DuckLakeMultiFileList::GetTableDeletions() const {
 
 bool DuckLakeMultiFileList::CanUseGlobalStats() const {
 	return read_info.CanUseGlobalStats();
+}
+
+bool DuckLakeMultiFileList::SupportsFilterPushdown() const {
+	// a column retyped in this transaction keeps the stats written under its old type until commit
+	return read_info.scan_type == DuckLakeScanType::SCAN_TABLE && !read_info.table.ChangedColumnType();
 }
 
 bool DuckLakeMultiFileList::IsDeleteScan() const {
@@ -719,14 +843,6 @@ const vector<DuckLakeFileListEntry> &DuckLakeMultiFileList::GetFiles() const {
 		read_file_list = true;
 	}
 	return files;
-}
-
-idx_t DuckLakeMultiFileList::GetTransactionLocalRowIdStart(idx_t transaction_row_start) const {
-	if (transaction_local_data && transaction_local_data->HasPreservedRowIds()) {
-		// preserved row_ids are absolute, so row_id_start must be 0
-		return 0;
-	}
-	return transaction_row_start;
 }
 
 } // namespace duckdb

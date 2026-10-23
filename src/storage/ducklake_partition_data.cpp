@@ -3,10 +3,12 @@
 #include "storage/ducklake_table_entry.hpp"
 #include "duckdb/common/hive_partitioning.hpp"
 #include "duckdb/common/types/date.hpp"
+#include "duckdb/common/types/decimal.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/function/function_binder.hpp"
 #include "duckdb/planner/expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
 
 #include <cstring>
 
@@ -99,39 +101,13 @@ static string GetEpochTransformPart(DuckLakeTransformType transform_type) {
 	}
 }
 
-string DuckLakePartitionUtils::GetPartitionSQLExpression(const DuckLakeTransform &transform, const string &col_name,
-                                                         const LogicalType &source_type) {
-	if (transform.type == DuckLakeTransformType::IDENTITY) {
-		if (source_type.id() == LogicalTypeId::VARCHAR) {
-			// files are partitioned on the raw bytes
-			return "(" + col_name + " COLLATE \"binary\")";
-		}
-		return col_name;
-	}
-	if (transform.type == DuckLakeTransformType::BUCKET) {
-		// Return the actual SQL expression that computes the bucket assignment
-		return "(murmur3_32(" + col_name + ") & 2147483647) % " + to_string(transform.bucket_count);
-	}
-	if (IsEpochTransform(transform.type)) {
-		// Must mirror ApplyPartitionTransform exactly
-		string col_expr = col_name;
-		auto source_id = source_type.id();
-		if (source_id == LogicalTypeId::TIMESTAMP_NS || source_id == LogicalTypeId::TIMESTAMP_TZ_NS) {
-			string nanos = "epoch_ns(" + col_name + ")";
-			col_expr = "make_timestamp((" + nanos + " - ((" + nanos + " % 1000) + 1000) % 1000) // 1000)";
-		} else if (source_id == LogicalTypeId::TIMESTAMP_TZ) {
-			col_expr = "make_timestamp(epoch_us(" + col_expr + "))";
-		}
-		return "date_diff('" + GetEpochTransformPart(transform.type) + "', DATE '1970-01-01', " + col_expr + ")";
-	}
-	return GetTransformName(transform.type) + "(" + col_name + ")";
-}
-
 LogicalType DuckLakePartitionUtils::GetPartitionKeyType(DuckLakeTransformType transform_type,
                                                         const LogicalType &source_type) {
 	switch (transform_type) {
+	// LCOV_EXCL_START
 	case DuckLakeTransformType::IDENTITY:
 		return source_type;
+	// LCOV_EXCL_STOP
 	case DuckLakeTransformType::YEAR:
 	case DuckLakeTransformType::MONTH:
 	case DuckLakeTransformType::DAY:
@@ -148,28 +124,13 @@ LogicalType DuckLakePartitionUtils::GetPartitionKeyType(DuckLakeTransformType tr
 	}
 }
 
-string DuckLakePartitionUtils::BuildPartitionFilter(const vector<string> &partition_sql_exprs,
-                                                    const vector<Value> &partition_values) {
-	string filter;
-	for (idx_t p = 0; p < partition_sql_exprs.size(); p++) {
-		if (p > 0) {
-			filter += " AND ";
-		}
-		auto &val = partition_values[p];
-		if (val.IsNull()) {
-			filter += partition_sql_exprs[p] + " IS NULL";
-		} else {
-			filter += partition_sql_exprs[p] + " = " + val.ToSQLString();
-		}
-	}
-	return filter;
-}
-
 string DuckLakePartitionUtils::BuildHivePartitionPath(DuckLakeTableEntry &table, const vector<Value> &partition_values,
                                                       const string &separator) {
 	auto partition_data = table.GetPartitionData();
 	if (!partition_data) {
+		// LCOV_EXCL_START
 		return string();
+		// LCOV_EXCL_STOP
 	}
 	if (partition_data->fields.size() != partition_values.size()) {
 		throw InternalException("DuckLake partition value count does not match partition spec");
@@ -228,6 +189,39 @@ unique_ptr<Expression> DuckLakePartitionUtils::ApplyBucketTransform(ClientContex
 	                    make_uniq<BoundConstantExpression>(Value::INTEGER(NumericCast<int32_t>(bucket_count))));
 }
 
+//! Types with the same bucket hash type give every value the same murmur3_32 hash
+static LogicalType GetBucketHashType(const LogicalType &type) {
+	switch (type.id()) {
+	case LogicalTypeId::TINYINT:
+	case LogicalTypeId::SMALLINT:
+	case LogicalTypeId::INTEGER:
+	case LogicalTypeId::BIGINT:
+		// hashed as a BIGINT like the unscaled value of a DECIMAL up to 18 digits
+		return LogicalType::DECIMAL(Decimal::MAX_WIDTH_INT64, 0);
+	case LogicalTypeId::UTINYINT:
+	case LogicalTypeId::USMALLINT:
+	case LogicalTypeId::UINTEGER:
+	case LogicalTypeId::UBIGINT:
+	case LogicalTypeId::HUGEINT:
+	case LogicalTypeId::UHUGEINT:
+		// hashed as their text like a wider DECIMAL
+		return LogicalType::DECIMAL(Decimal::MAX_WIDTH_DECIMAL, 0);
+	case LogicalTypeId::DECIMAL: {
+		auto width = DecimalType::GetWidth(type) <= Decimal::MAX_WIDTH_INT64 ? Decimal::MAX_WIDTH_INT64
+		                                                                     : Decimal::MAX_WIDTH_DECIMAL;
+		return LogicalType::DECIMAL(width, DecimalType::GetScale(type));
+	}
+	case LogicalTypeId::FLOAT:
+		return LogicalType::DOUBLE;
+	default:
+		return type;
+	}
+}
+
+bool DuckLakePartitionUtils::BucketChangesWithType(const LogicalType &source_type, const LogicalType &target_type) {
+	return GetBucketHashType(source_type) != GetBucketHashType(target_type);
+}
+
 static unique_ptr<Expression> FloorNanosToMicros(ClientContext &context, unique_ptr<Expression> column_expr) {
 	auto bigint_const = [](int64_t val) {
 		return make_uniq<BoundConstantExpression>(Value::BIGINT(val));
@@ -259,6 +253,20 @@ static unique_ptr<Expression> ApplyEpochTransform(ClientContext &context, unique
 	children.push_back(std::move(column_expr));
 	FunctionBinder binder(context);
 	return binder.BindScalarFunction(Identifier::DefaultSchema(), "date_diff", std::move(children));
+}
+
+void DuckLakePartitionUtils::VerifyTransformSupportsType(ClientContext &context, const DuckLakePartitionField &field,
+                                                         const string &column_name, const LogicalType &type) {
+	try {
+		ApplyPartitionTransform(context, make_uniq<BoundReferenceExpression>(type, 0ULL), field);
+	} catch (std::exception &ex) {
+		ErrorData error(ex);
+		if (error.Type() != ExceptionType::BINDER) {
+			throw;
+		}
+		throw InvalidInputException("Cannot partition by %s(%s) - the transform does not support columns of type %s",
+		                            GetTransformName(field.transform.type), column_name, type);
+	}
 }
 
 unique_ptr<Expression> DuckLakePartitionUtils::ApplyPartitionTransform(ClientContext &context,

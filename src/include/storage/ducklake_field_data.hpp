@@ -49,9 +49,6 @@ public:
 	const DuckLakeColumnData &GetColumnData() const {
 		return column_data;
 	}
-	DuckLakeColumnData &GetColumnDataMutable() {
-		return column_data;
-	}
 	const string &Name() const {
 		return name;
 	}
@@ -93,6 +90,9 @@ private:
 	case_insensitive_map_t<idx_t> child_map;
 	optional_ptr<DuckLakeFieldId> parent;
 };
+
+//! The nested type with the names and types of the given children
+LogicalType GetNewNestedType(const LogicalType &type, const vector<unique_ptr<DuckLakeFieldId>> &new_children);
 
 class DuckLakeFieldData {
 public:

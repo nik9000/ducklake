@@ -6,6 +6,9 @@
 #include "storage/ducklake_metadata_info.hpp"
 #include "storage/ducklake_table_entry.hpp"
 #include "common/ducklake_types.hpp"
+#include "duckdb/common/type_visitor.hpp"
+#include "duckdb/common/vector/list_vector.hpp"
+#include "duckdb/common/vector/struct_vector.hpp"
 
 namespace duckdb {
 
@@ -66,7 +69,9 @@ static string GetPostgresStatsType(const LogicalType &type) {
 	case LogicalTypeId::DECIMAL:
 		return type.ToString();
 	default:
+		// LCOV_EXCL_START
 		return string();
+		// LCOV_EXCL_STOP
 	}
 }
 
@@ -94,6 +99,10 @@ string PostgresMetadataManager::CastValueToTarget(const Value &value, const Logi
 	}
 	if (IsPostgresTemporalStatsType(type) && !CanCastPostgresTemporalValue(value, type)) {
 		return string();
+	}
+	if (type.id() == LogicalTypeId::FLOAT) {
+		// a bare number is NUMERIC, which compares with REAL bounds as DOUBLE PRECISION
+		return "CAST(" + value.ToString() + " AS " + GetPostgresStatsType(type) + ")";
 	}
 	if (type.IsNumeric()) {
 		return value.ToString();
@@ -158,6 +167,12 @@ PostgresMetadataManager::PostgresMetadataManager(DuckLakeTransaction &transactio
     : DuckLakeMetadataManager(transaction) {
 }
 
+bool PostgresMetadataManager::InsertsInlinedRowsAfterBatch(idx_t row_count) const {
+	// the copy of a separate insert costs more round trips than parsing the VALUES text of a few rows
+	static constexpr idx_t MAX_INLINED_ROWS_IN_BATCH = 100;
+	return row_count > MAX_INLINED_ROWS_IN_BATCH;
+}
+
 bool PostgresMetadataManager::TypeIsNativelySupported(const LogicalType &type) {
 	switch (type.id()) {
 	// Unnamed composite types are not supported.
@@ -167,7 +182,8 @@ bool PostgresMetadataManager::TypeIsNativelySupported(const LogicalType &type) {
 	case LogicalTypeId::UBIGINT:
 	case LogicalTypeId::HUGEINT:
 	case LogicalTypeId::UHUGEINT:
-	// Postgres timestamp/date ranges are narrower than DuckDB's
+	// Postgres timestamp/date ranges are narrower than DuckDB's, and its TIME keeps only microseconds
+	case LogicalTypeId::TIME_NS:
 	case LogicalTypeId::DATE:
 	case LogicalTypeId::TIMESTAMP:
 	case LogicalTypeId::TIMESTAMP_TZ:
@@ -186,6 +202,54 @@ bool PostgresMetadataManager::TypeIsNativelySupported(const LogicalType &type) {
 	default:
 		return true;
 	}
+}
+
+static bool ContainsNulByte(Vector &vector, idx_t offset, idx_t count) {
+	vector.Flatten();
+	auto &validity = FlatVector::Validity(vector);
+	switch (vector.GetType().id()) {
+	case LogicalTypeId::VARCHAR: {
+		auto strings = FlatVector::GetData<string_t>(vector);
+		for (idx_t i = offset; i < offset + count; i++) {
+			if (validity.RowIsValid(i) && memchr(strings[i].GetData(), '\0', strings[i].GetSize())) {
+				return true;
+			}
+		}
+		return false;
+	}
+	case LogicalTypeId::STRUCT:
+		for (auto &child : StructVector::GetEntries(vector)) {
+			if (ContainsNulByte(child, offset, count)) {
+				return true;
+			}
+		}
+		return false;
+	case LogicalTypeId::LIST:
+	case LogicalTypeId::MAP: {
+		auto entries = FlatVector::GetData<list_entry_t>(vector);
+		auto &child = ListVector::GetChildMutable(vector);
+		for (idx_t i = offset; i < offset + count; i++) {
+			if (validity.RowIsValid(i) && ContainsNulByte(child, entries[i].offset, entries[i].length)) {
+				return true;
+			}
+		}
+		return false;
+	}
+	default:
+		return false;
+	}
+}
+
+bool PostgresMetadataManager::CanInlineValues(DataChunk &chunk) {
+	// nested values are stored as text, which cannot hold a NUL byte
+	for (auto &column : chunk.data) {
+		auto &type = column.GetType();
+		if (DuckLakeTypes::IsNested(type) && TypeVisitor::Contains(type, LogicalTypeId::VARCHAR) &&
+		    ContainsNulByte(column, 0, chunk.size())) {
+			return false;
+		}
+	}
+	return true;
 }
 
 string PostgresMetadataManager::GetColumnTypeInternal(const LogicalType &column_type) {
@@ -208,6 +272,7 @@ string PostgresMetadataManager::GetColumnTypeInternal(const LogicalType &column_
 	case LogicalTypeId::UBIGINT:
 	case LogicalTypeId::HUGEINT:
 	case LogicalTypeId::UHUGEINT:
+	case LogicalTypeId::TIME_NS:
 	case LogicalTypeId::DATE:
 	case LogicalTypeId::TIMESTAMP:
 	case LogicalTypeId::TIMESTAMP_TZ:
@@ -219,6 +284,24 @@ string PostgresMetadataManager::GetColumnTypeInternal(const LogicalType &column_
 	default:
 		return column_type.ToString();
 	}
+}
+
+bool PostgresMetadataManager::IsRetryableCommitError(const string &message) const {
+	// the server error follows the failed query, which can contain any text
+	auto server_error_start = message.rfind("\": ");
+	auto server_error = server_error_start == string::npos ? message : message.substr(server_error_start);
+	// constraint names are not translated, so a conflict on a metadata primary key is found in any language
+	for (auto end = server_error.find("_pkey"); end != string::npos; end = server_error.find("_pkey", end + 1)) {
+		auto start = end;
+		while (start > 0 &&
+		       (StringUtil::CharacterIsAlphaNumeric(server_error[start - 1]) || server_error[start - 1] == '_')) {
+			start--;
+		}
+		if (StringUtil::StartsWith(server_error.substr(start, end - start), "ducklake_")) {
+			return true;
+		}
+	}
+	return false;
 }
 
 bool PostgresMetadataManager::InlinedDeletionTableExists(const string &table_name) {
@@ -256,7 +339,7 @@ void PostgresMetadataManager::MigrateInlinedDataTypes() {
 		col_names.end_snapshot = names[2].GetIdentifierName();
 		vector<string> select_list;
 		for (idx_t i = 0; i < 3; i++) {
-			select_list.push_back(SQLIdentifier::ToString(names[i].GetIdentifierName()));
+			select_list.push_back(SQLQuotedIdentifier::ToString(names[i].GetIdentifierName()));
 		}
 		string column_defs;
 		bool rewrite = false;
@@ -267,16 +350,21 @@ void PostgresMetadataManager::MigrateInlinedDataTypes() {
 				rewrite = false;
 				break;
 			}
-			DuckLakeColumnInfo column;
-			column.type = column_type->second;
-			auto storage_type_name = GetColumnType(column);
-			auto storage_type = UnboundType::TryParseAndDefaultBind(storage_type_name);
-			auto type = DuckLakeTypes::FromString(column.type);
+			auto type = DuckLakeTypes::FromString(column_type->second);
 			auto native_type = type.HasAlias() ? LogicalType(type.id()) : type;
 			// DuckLake 0.3 stored values with the native type of their DuckLake type, other columns are kept
 			auto &stored_type = probe->GetTypes()[i];
-			bool convert = stored_type != storage_type && stored_type == native_type;
-			auto column_name = SQLIdentifier::ToString(name);
+			string storage_type_name;
+			bool convert = false;
+			// nested columns are stored as VARCHAR in every version
+			if (!DuckLakeTypes::IsNested(type)) {
+				DuckLakeColumnInfo column;
+				column.type = column_type->second;
+				storage_type_name = GetColumnType(column);
+				auto storage_type = UnboundType::TryParseAndDefaultBind(storage_type_name);
+				convert = stored_type != storage_type && stored_type == native_type;
+			}
+			auto column_name = SQLQuotedIdentifier::ToString(name);
 			column_defs += StringUtil::Format("%s%s %s", column_defs.empty() ? "" : ", ", column_name,
 			                                  convert ? storage_type_name : stored_type.ToString());
 			select_list.push_back(convert ? DuckLakeUtil::InlinedStorageExpression(*this, column_name, type)
@@ -305,36 +393,51 @@ unique_ptr<QueryResult> PostgresMetadataManager::Execute(DuckLakeSnapshot snapsh
 	auto &ducklake_catalog = transaction.GetCatalog();
 	SubstituteCatalogPlaceholders(query, SQLQuotedIdentifier::ToString(ducklake_catalog.MetadataSchemaName()));
 	auto catalog_literal = SQLString::ToString(ducklake_catalog.MetadataDatabaseName());
+	// casts of float bounds to text keep their exact value
+	query = "SET LOCAL extra_float_digits = 3;" + query;
 	auto result = transaction.GetConnection().Query(
 	    StringUtil::Format("CALL postgres_execute(%s, %s, prepare=FALSE)", catalog_literal, SQLString(query)));
 	return std::move(result);
 }
 
 void PostgresMetadataManager::ClearCache() {
-	auto result = transaction.ExecuteRaw("CALL pg_clear_cache();");
+	auto result = transaction.ExecuteRaw("CALL postgres_clear_cache();");
 	result->ThrowIfError("Failed to clear the PostgreSQL metadata cache: ");
 }
 
-string PostgresMetadataManager::GetLatestSnapshotQuery() const {
-	return R"(
-	SELECT * FROM postgres_query({METADATA_CATALOG_NAME_LITERAL},
-		'SELECT snapshot_id, schema_version, next_catalog_id, next_file_id,
-		 (SELECT MAX(value) FROM {METADATA_SCHEMA_ESCAPED}.ducklake_metadata WHERE key = ''version'')
-		 FROM {METADATA_SCHEMA_ESCAPED}.ducklake_snapshot WHERE snapshot_id = (
-		     SELECT MAX(snapshot_id) FROM {METADATA_SCHEMA_ESCAPED}.ducklake_snapshot
-		 );')
-	)";
+static string PostgresQuery(const string &remote_query) {
+	return StringUtil::Format("SELECT * FROM postgres_query({METADATA_CATALOG_NAME_LITERAL}, %s)",
+	                          SQLString(remote_query));
 }
 
-string PostgresMetadataManager::GenerateFileListQuery(DuckLakeTableEntry &table, const FilterPushdownInfo *filter_info,
+string PostgresMetadataManager::GetLatestSnapshotQuery() const {
+	auto remote_query = LatestSnapshotQuery();
+	SubstituteCatalogPlaceholders(remote_query,
+	                              SQLQuotedIdentifier::ToString(transaction.GetCatalog().MetadataSchemaName()));
+	return PostgresQuery(remote_query);
+}
+
+string PostgresMetadataManager::GetSnapshotAndStatsAndChangesQuery(DuckLakeSnapshot snapshot,
+                                                                   bool include_exactness) const {
+	// one statement reads the latest snapshot and the table stats from the same state at any isolation level
+	auto remote_query = SnapshotAndStatsAndChangesQuery(include_exactness);
+	SubstituteCatalogPlaceholders(remote_query,
+	                              SQLQuotedIdentifier::ToString(transaction.GetCatalog().MetadataSchemaName()));
+	SubstituteSnapshotPlaceholders(snapshot, remote_query);
+	return PostgresQuery(remote_query);
+}
+
+string PostgresMetadataManager::GenerateFileListQuery(DuckLakeTableEntry &table, DuckLakeSnapshot snapshot,
+                                                      const FilterPushdownInfo *filter_info,
                                                       const vector<DuckLakeFileListDynamicFilter> &dynamic_filters,
                                                       const vector<idx_t> &runtime_filter_stats_columns,
                                                       FileListType file_list_type, const string &) {
+	auto schema = SQLQuotedIdentifier::ToString(transaction.GetCatalog().MetadataSchemaName());
 	auto remote_query = DuckLakeMetadataManager::GenerateFileListQuery(
-	    table, filter_info, dynamic_filters, runtime_filter_stats_columns, file_list_type, "{METADATA_SCHEMA_ESCAPED}");
-
-	return StringUtil::Format("SELECT * FROM postgres_query({METADATA_CATALOG_NAME_LITERAL}, %s)",
-	                          SQLString(remote_query));
+	    table, snapshot, filter_info, dynamic_filters, runtime_filter_stats_columns, file_list_type, schema);
+	// placeholders inside the literal are not replaced later
+	SubstituteSnapshotPlaceholders(snapshot, remote_query);
+	return PostgresQuery(remote_query);
 }
 
 } // namespace duckdb

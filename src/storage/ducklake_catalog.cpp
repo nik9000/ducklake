@@ -1,4 +1,5 @@
 #include "storage/ducklake_catalog.hpp"
+#include "duckdb/logging/logger.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/planner/logical_operator.hpp"
 #include "duckdb/main/database_manager.hpp"
@@ -267,8 +268,10 @@ idx_t EstimateCatalogSetMemory(const DuckLakeCatalogSet &catalog_set) {
 	for (auto &entry : catalog_set.GetEntries()) {
 		auto &catalog_entry = *entry.second;
 		if (catalog_entry.type != CatalogType::SCHEMA_ENTRY) {
+			// LCOV_EXCL_START
 			estimate += EstimateCatalogEntryMemory(catalog_entry);
 			continue;
+			// LCOV_EXCL_STOP
 		}
 		estimate += EstimateSchemaMemory(catalog_entry.Cast<DuckLakeSchemaEntry>());
 	}
@@ -336,9 +339,12 @@ void DuckLakeCatalog::FinalizeLoad(optional_ptr<ClientContext> context) {
 	// initialize the metadata database
 	unique_ptr<Connection> con;
 	if (!context) {
+		// only reached when a lake opens as the main database, see pdet/ducklake_internal#115
+		// LCOV_EXCL_START
 		con = make_uniq<Connection>(GetDatabase());
 		con->BeginTransaction();
 		context = con->context.get();
+		// LCOV_EXCL_STOP
 	}
 	if (options.config_options.find("write_deletion_vectors") == options.config_options.end()) {
 		bool write_deletion_vectors = false;
@@ -351,12 +357,20 @@ void DuckLakeCatalog::FinalizeLoad(optional_ptr<ClientContext> context) {
 	initializer.Initialize();
 	db.tags["data_path"] = DataPath();
 	if (con) {
+		// only reached when a lake opens as the main database, see pdet/ducklake_internal#115
+		// LCOV_EXCL_START
 		con->Commit();
+		// LCOV_EXCL_STOP
 	}
 	initialized = true;
 }
 
 static bool CanGeneratePathFromName(const string &name) {
+	// file systems allow at most 255 bytes in a file name
+	static constexpr idx_t MAX_FILE_NAME_LENGTH = 255;
+	if (name.size() > MAX_FILE_NAME_LENGTH) {
+		return false;
+	}
 	for (auto c : name) {
 		if (StringUtil::CharacterIsAlphaNumeric(c)) {
 			continue;
@@ -370,7 +384,7 @@ static bool CanGeneratePathFromName(const string &name) {
 }
 
 string DuckLakeCatalog::GeneratePathFromName(const string &uuid, const string &name) {
-	// if the name has special characters we fallback to uuid
+	// if the name has special characters or is too long we fall back to the uuid
 	if (CanGeneratePathFromName(name)) {
 		return name + separator;
 	}
@@ -428,7 +442,10 @@ void DuckLakeCatalog::DropSchema(ClientContext &context, DropInfo &info) {
 
 void DuckLakeCatalog::ScanSchemas(ClientContext &context, std::function<void(SchemaCatalogEntry &)> callback) {
 	if (!initialized) {
+		// only reached when a lake opens as the main database, see pdet/ducklake_internal#115
+		// LCOV_EXCL_START
 		return;
+		// LCOV_EXCL_STOP
 	}
 	auto transaction = GetCatalogTransaction(context);
 	auto &duck_transaction = transaction.transaction->Cast<DuckLakeTransaction>();
@@ -457,7 +474,9 @@ optional_ptr<CatalogEntry> DuckLakeCatalog::GetEntryById(DuckLakeTransaction &tr
                                                          SchemaIndex schema_id) {
 	auto local_entry = transaction.GetLocalEntryById(schema_id);
 	if (local_entry) {
+		// LCOV_EXCL_START
 		return local_entry;
+		// LCOV_EXCL_STOP
 	}
 	auto &schema = GetSchemaForSnapshot(transaction, snapshot);
 	return schema.GetEntryById(schema_id);
@@ -465,17 +484,8 @@ optional_ptr<CatalogEntry> DuckLakeCatalog::GetEntryById(DuckLakeTransaction &tr
 
 optional_ptr<CatalogEntry> DuckLakeCatalog::GetEntryById(DuckLakeTransaction &transaction, DuckLakeSnapshot snapshot,
                                                          TableIndex table_id) {
-	auto local_entry = transaction.GetLocalEntryById(table_id);
-	if (local_entry) {
-		return local_entry;
-	}
 	auto &schema = GetSchemaForSnapshot(transaction, snapshot);
 	return schema.GetEntryById(table_id);
-}
-
-idx_t DuckLakeCatalog::GetBeginSnapshotForTable(TableIndex table_id, DuckLakeTransaction &transaction) {
-	auto &metadata_manager = transaction.GetMetadataManager();
-	return metadata_manager.GetBeginSnapshotForTable(table_id);
 }
 
 idx_t DuckLakeCatalog::GetBeginSnapshotForSchemaVersion(TableIndex table_id, idx_t schema_version,
@@ -490,7 +500,9 @@ optional_ptr<DuckLakeTableEntry> DuckLakeCatalog::GetTableAtSchemaVersion(DuckLa
 	                          0, 0);
 	auto entry = GetEntryById(transaction, snapshot, table_id);
 	if (!entry) {
+		// LCOV_EXCL_START
 		return nullptr;
+		// LCOV_EXCL_STOP
 	}
 	return &entry->Cast<DuckLakeTableEntry>();
 }
@@ -523,7 +535,7 @@ static unique_ptr<DuckLakeFieldId> TransformColumnType(const DuckLakeColumnInfo 
 			col_data.default_value = ConstantExpression::Null();
 		} else {
 			if (col.default_value_type == "literal") {
-				col_data.default_value = ConstantExpression::FromValue(col.default_value);
+				col_data.default_value = DuckLakeUtil::LiteralDefaultExpression(col.default_value, col_type);
 			} else if (col.default_value_type == "expression") {
 				col_data.default_value =
 				    Parser::GetBuiltinParser().ParseSingleExpression(col.default_value.GetValue<string>());
@@ -541,28 +553,71 @@ static unique_ptr<DuckLakeFieldId> TransformColumnType(const DuckLakeColumnInfo 
 	return make_uniq<DuckLakeFieldId>(std::move(col_data), col.name, std::move(type), std::move(child_fields));
 }
 
-//! Binds a macro dialect type without catalog lookups, since those would reenter the catalog that is loading
-static LogicalType BindMacroDialectType(const string &type) {
-	return TypeVisitor::VisitReplace(UnboundType::TryParseAndDefaultBind(type), [](const LogicalType &child) {
-		if (child.id() != LogicalTypeId::UNBOUND) {
-			return child;
-		}
-		// the types that are not built in, such as JSON, are DuckLake types
-		auto &type_expr = UnboundType::GetTypeExpression(child)->Cast<TypeExpression>();
-		return DuckLakeTypes::FromString(type_expr.GetTypeName().GetIdentifierName());
-	});
-}
-
 static LogicalType ParseMacroParameterType(const string &type) {
 	LogicalType result;
 	try {
 		result = DuckLakeTypes::FromString(type);
 	} catch (InvalidInputException &) {
 		// nested types are stored as types of the macro dialect
-		return BindMacroDialectType(type);
+		// catalog lookups would reenter the catalog that is loading
+		return DuckLakeTypes::FromDuckDBString(type);
 	}
 	// older versions stored nested types without their child types, so these parameters are loaded untyped
 	return DuckLakeTypes::IsNested(result) ? LogicalType::UNKNOWN : result;
+}
+
+//! The type of constants inside list and struct literals, the form in which DuckLake 1.0 wrote some nested values
+static bool TryGetNestedLiteralType(ClientContext &context, const ParsedExpression &expr, LogicalType &result) {
+	if (expr.GetExpressionType() == ExpressionType::VALUE_CONSTANT) {
+		result = expr.Cast<ConstantExpression>().GetLiteral().ToValue().type();
+		return true;
+	}
+	if (expr.GetExpressionClass() != ExpressionClass::FUNCTION) {
+		return false;
+	}
+	auto &function = expr.Cast<FunctionExpression>();
+	auto &name = function.FunctionName().GetIdentifierName();
+	bool is_list = name == "list_value";
+	if (function.IsOperator() || (!is_list && name != "struct_pack")) {
+		return false;
+	}
+	LogicalType child_type = LogicalType::SQLNULL;
+	child_list_t<LogicalType> child_types;
+	for (auto &argument : function.GetArguments()) {
+		LogicalType argument_type;
+		if (!TryGetNestedLiteralType(context, argument.GetExpression(), argument_type)) {
+			return false;
+		}
+		if (!is_list) {
+			child_types.emplace_back(argument.GetName().GetIdentifierName(), argument_type);
+		} else if (!LogicalType::TryGetMaxLogicalType(context, child_type, argument_type, child_type)) {
+			return false;
+		}
+	}
+	result = is_list ? LogicalType::LIST(child_type) : LogicalType::STRUCT(std::move(child_types));
+	return true;
+}
+
+//! DuckLake 1.0 stored a nested default as the text of its value, which does not quote most strings
+static unique_ptr<ParsedExpression> LegacyNestedDefault(ClientContext &context, const string &macro_name,
+                                                        const DuckLakeMacroParameters &param) {
+	try {
+		auto expr = Parser::GetBuiltinParser().ParseSingleExpression(StringValue::Get(param.default_value));
+		LogicalType type;
+		Value value;
+		if (TryGetNestedLiteralType(context, *expr, type) &&
+		    DuckLakeUtil::TryReadTextAs(param.default_value, type, value)) {
+			return ConstantExpression::FromValue(value);
+		}
+	} catch (std::exception &) {
+	}
+	// the macro stays usable when the parameter is passed
+	vector<unique_ptr<ParsedExpression>> children;
+	children.push_back(ConstantExpression::FromValue(Value(macro_name)));
+	children.push_back(ConstantExpression::FromValue(Value(param.parameter_name)));
+	QualifiedName function_name(Identifier(SYSTEM_CATALOG), Identifier(DEFAULT_SCHEMA),
+	                            Identifier("ducklake_unreadable_macro_default"));
+	return make_uniq<FunctionExpression>(function_name, std::move(children));
 }
 
 unique_ptr<CreateMacroInfo> CreateMacroInfoFromDucklake(ClientContext &context, DuckLakeMacroInfo &macro,
@@ -599,10 +654,16 @@ unique_ptr<CreateMacroInfo> CreateMacroInfoFromDucklake(ClientContext &context, 
 				continue;
 			}
 			auto expr_type = DuckLakeTypes::FromString(param.default_value_type);
+			bool null_default = StringValue::Get(param.default_value) == "NULL";
+			if (DuckLakeTypes::IsNested(expr_type) && !null_default) {
+				macro_function->default_parameters.insert(Identifier(param.parameter_name),
+				                                          LegacyNestedDefault(context, macro.macro_name, param));
+				continue;
+			}
 			if (expr_type.id() != LogicalTypeId::UNKNOWN) {
 				Value casted_value;
 				// typed NULL defaults are stored as the text NULL
-				if (StringValue::Get(param.default_value) == "NULL" && !DuckLakeTypes::IsStringType(expr_type)) {
+				if (null_default && !DuckLakeTypes::IsStringType(expr_type)) {
 					// nested types are stored without their child types
 					casted_value = expr_type.IsNested() ? Value() : Value(expr_type);
 				} else {
@@ -673,6 +734,17 @@ static set<SchemaIndex> FindUnreachableSchemas(const vector<DuckLakeSchemaInfo> 
 	return unreachable;
 }
 
+void DuckLakeCatalog::AssignStableOid(CatalogEntry &entry, idx_t id) {
+	lock_guard<mutex> guard(entry_oids_lock);
+	auto oid = entry_oids.emplace(make_pair(entry.type, id), entry.oid).first->second;
+	entry.oid = oid;
+}
+
+void DuckLakeCatalog::SetEntryOids(const ducklake_entry_oids_t &oids) {
+	lock_guard<mutex> guard(entry_oids_lock);
+	entry_oids.insert(oids.begin(), oids.end());
+}
+
 unique_ptr<DuckLakeCatalogSet> DuckLakeCatalog::LoadSchemaForSnapshot(DuckLakeTransaction &transaction,
                                                                       DuckLakeSnapshot snapshot) {
 	auto &metadata_manager = transaction.GetMetadataManager();
@@ -690,6 +762,7 @@ unique_ptr<DuckLakeCatalogSet> DuckLakeCatalog::LoadSchemaForSnapshot(DuckLakeTr
 		schema_info.SetSchema(Identifier(schema.name));
 		auto schema_entry = make_uniq<DuckLakeSchemaEntry>(*this, schema_info, schema.id, std::move(schema.uuid),
 		                                                   std::move(schema.path));
+		AssignStableOid(*schema_entry, schema.id.index);
 		loaded_schema_refs.emplace(schema.id, *schema_entry);
 		loaded_schemas.emplace(schema.id, std::move(schema_entry));
 	}
@@ -705,8 +778,10 @@ unique_ptr<DuckLakeCatalogSet> DuckLakeCatalog::LoadSchemaForSnapshot(DuckLakeTr
 		}
 		auto parent = loaded_schema_refs.find(schema.parent_id);
 		if (parent == loaded_schema_refs.end()) {
+			// LCOV_EXCL_START
 			throw InvalidInputException("Failed to load DuckLake - could not find the parent schema of schema \"%s\"",
 			                            schema.name);
+			// LCOV_EXCL_STOP
 		}
 		schema_entry->SetParentSchema(parent->second.get());
 		parent->second.get().AddEntry(CatalogType::SCHEMA_ENTRY, std::move(schema_entry));
@@ -769,6 +844,7 @@ unique_ptr<DuckLakeCatalogSet> DuckLakeCatalog::LoadSchemaForSnapshot(DuckLakeTr
 		auto table_entry = make_uniq<DuckLakeTableEntry>(
 		    *this, schema_entry, *create_table_info, table.id, std::move(table.uuid), std::move(table.path),
 		    std::move(field_data), optional_idx(), std::move(table.inlined_data_tables), LocalChangeType::NONE);
+		AssignStableOid(*table_entry, table.id.index);
 		schema_set->AddEntry(schema_entry, table.id, std::move(table_entry));
 	}
 
@@ -790,6 +866,7 @@ unique_ptr<DuckLakeCatalogSet> DuckLakeCatalog::LoadSchemaForSnapshot(DuckLakeTr
 		auto view_entry =
 		    make_uniq<DuckLakeViewEntry>(*this, schema_entry, *create_view_info, view.id, std::move(view.uuid),
 		                                 std::move(view.sql), LocalChangeType::NONE);
+		AssignStableOid(*view_entry, view.id.index);
 		schema_set->AddEntry(schema_entry, view.id, std::move(view_entry));
 	}
 
@@ -810,6 +887,7 @@ unique_ptr<DuckLakeCatalogSet> DuckLakeCatalog::LoadSchemaForSnapshot(DuckLakeTr
 			macro_catalog_entry =
 			    make_uniq<DuckLakeTableMacroEntry>(*this, schema_entry, *create_macro, macro.macro_id);
 		}
+		AssignStableOid(*macro_catalog_entry, macro.macro_id.index);
 		schema_set->AddEntry(schema_entry, macro.macro_id, std::move(macro_catalog_entry));
 	}
 
@@ -1014,11 +1092,14 @@ optional_ptr<SchemaCatalogEntry> DuckLakeCatalog::LookupSchema(CatalogTransactio
                                                                const EntryLookupInfo &schema_lookup,
                                                                OnEntryNotFound if_not_found) {
 	if (!initialized) {
+		// only reached when a lake opens as the main database, see pdet/ducklake_internal#115
+		// LCOV_EXCL_START
 		if (if_not_found == OnEntryNotFound::THROW_EXCEPTION) {
 			throw BinderException("Failed to look-up \"%s\" - DuckLake %s is not yet initialized",
 			                      schema_lookup.GetEntryName(), GetName());
 		}
 		return nullptr;
+		// LCOV_EXCL_STOP
 	}
 	auto at_clause = schema_lookup.GetAtClause();
 	auto &duck_transaction = transaction.transaction->Cast<DuckLakeTransaction>();
@@ -1083,10 +1164,6 @@ bool DuckLakeCatalog::InMemory() {
 
 string DuckLakeCatalog::GetDBPath() {
 	return options.metadata_path;
-}
-
-string DuckLakeCatalog::GetDataPath() {
-	return options.data_path;
 }
 
 optional_ptr<BoundAtClause> DuckLakeCatalog::CatalogSnapshot() const {
@@ -1219,13 +1296,6 @@ bool DuckLakeCatalog::TryGetConfigOption(const string &option, string &result, S
 	return true;
 }
 
-bool DuckLakeCatalog::TryGetConfigOption(const string &option, string &result, DuckLakeTableEntry &table) const {
-	auto &schema = table.ParentSchema().Cast<DuckLakeSchemaEntry>();
-	auto schema_id = schema.GetSchemaId();
-	auto table_id = table.GetTableId();
-	return TryGetConfigOption(option, result, schema_id, table_id, &table.GetTableOptions());
-}
-
 idx_t DuckLakeCatalog::DataInliningRowLimit(ClientContext &context, SchemaIndex schema_index, TableIndex table_index,
                                             optional_ptr<const map<string, string>> table_options) const {
 	string value_str;
@@ -1248,7 +1318,7 @@ idx_t DuckLakeCatalog::GetTargetFileSize(ClientContext &context, SchemaIndex sch
 	Value setting_val;
 	if (context.TryGetCurrentSetting("ducklake_target_file_size", setting_val) && !setting_val.IsNull() &&
 	    !setting_val.ToString().empty()) {
-		return DBConfig::ParseMemoryLimit(setting_val.ToString());
+		return DBConfig::ParseMemoryLimitOrMaximum(setting_val.ToString());
 	}
 	return GetConfigOption<idx_t>("target_file_size", schema_id, table_id, DEFAULT_TARGET_FILE_SIZE, table_options);
 }
@@ -1260,20 +1330,23 @@ idx_t DuckLakeCatalog::GetTargetFileSize(ClientContext &context, DuckLakeTableEn
 
 idx_t DuckLakeCatalog::GetInliningLimit(ClientContext &context, DuckLakeTableEntry &table) {
 	auto &schema = table.ParentSchema().Cast<DuckLakeSchemaEntry>();
-	return GetInliningLimit(context, schema.GetSchemaId(), table.GetTableId(), table.GetColumns(),
+	return GetInliningLimit(context, table.name, schema.GetSchemaId(), table.GetTableId(), table.GetColumns(),
 	                        &table.GetTableOptions());
 }
 
-idx_t DuckLakeCatalog::GetInliningLimit(ClientContext &context, SchemaIndex schema_id, TableIndex table_id,
-                                        const ColumnList &columns,
+idx_t DuckLakeCatalog::GetInliningLimit(ClientContext &context, const Identifier &table_name, SchemaIndex schema_id,
+                                        TableIndex table_id, const ColumnList &columns,
                                         optional_ptr<const map<string, string>> table_options) {
 	idx_t limit = DataInliningRowLimit(context, schema_id, table_id, table_options);
 	if (limit == 0) {
 		return 0;
 	}
 	auto &transaction = DuckLakeTransaction::Get(context, *this);
-	auto &metadata_manager = transaction.GetMetadataManager();
-	if (!metadata_manager.CanInlineColumns(columns)) {
+	auto obstacle = transaction.GetMetadataManager().GetInliningObstacle(columns);
+	if (!obstacle.empty()) {
+		DUCKDB_LOG_WARNING(context,
+		                   "DuckLake writes the rows of table %s to files instead of inlining them, because %s",
+		                   table_name, obstacle);
 		return 0;
 	}
 	return limit;
@@ -1296,6 +1369,13 @@ bool DuckLakeCatalog::AutoCompactEnabled(SchemaIndex schema_id, TableIndex table
 bool DuckLakeCatalog::AutoCompactEnabled(DuckLakeTableEntry &table) const {
 	auto &schema = table.ParentSchema().Cast<DuckLakeSchemaEntry>();
 	return AutoCompactEnabled(schema.GetSchemaId(), table.GetTableId());
+}
+
+void DuckLakeCatalog::VerifyWritable() const {
+	if (GetAttached().IsReadOnly()) {
+		throw InvalidInputException("Cannot write to \"%s\", which is attached in read-only mode",
+		                            GetName().GetIdentifierName());
+	}
 }
 
 bool DuckLakeCatalog::WriteDeletionVectors(DuckLakeTableEntry &table) const {
@@ -1333,6 +1413,22 @@ void DuckLakeCatalog::CacheInlinedDeletionTableResult(TableIndex table_id, DuckL
 	}
 }
 
+DuckLakeTableSchemaVersions DuckLakeCatalog::GetTableSchemaVersions(DuckLakeTransaction &transaction,
+                                                                    TableIndex table_id) {
+	auto snapshot = transaction.GetSnapshot();
+	{
+		lock_guard<mutex> guard(schema_version_snapshot_lock);
+		auto entry = table_schema_versions.find(table_id.index);
+		if (entry != table_schema_versions.end() && entry->second.first == snapshot.schema_version) {
+			return entry->second.second;
+		}
+	}
+	auto schema_versions = transaction.GetMetadataManager().GetTableSchemaVersions(table_id, snapshot);
+	lock_guard<mutex> guard(schema_version_snapshot_lock);
+	table_schema_versions[table_id.index] = make_pair(snapshot.schema_version, schema_versions);
+	return schema_versions;
+}
+
 optional_idx DuckLakeCatalog::TryGetSchemaVersionBeginSnapshot(TableIndex table_id, idx_t schema_version) {
 	lock_guard<mutex> guard(schema_version_snapshot_lock);
 	auto entry = schema_version_begin_snapshots.find(make_pair(table_id.index, schema_version));
@@ -1345,6 +1441,39 @@ optional_idx DuckLakeCatalog::TryGetSchemaVersionBeginSnapshot(TableIndex table_
 void DuckLakeCatalog::CacheSchemaVersionBeginSnapshot(TableIndex table_id, idx_t schema_version, idx_t begin_snapshot) {
 	lock_guard<mutex> guard(schema_version_snapshot_lock);
 	schema_version_begin_snapshots[make_pair(table_id.index, schema_version)] = begin_snapshot;
+}
+
+bool DuckLakeCatalog::ColumnHoldsValues(TableIndex table_id, FieldIndex column_id, idx_t snapshot_id) {
+	lock_guard<mutex> guard(columns_with_values_lock);
+	if (!columns_with_values_snapshot.IsValid() || columns_with_values_snapshot.GetIndex() != snapshot_id) {
+		return false;
+	}
+	return columns_with_values.count(make_pair(table_id.index, column_id.index)) > 0;
+}
+
+void DuckLakeCatalog::SetColumnHoldsValues(TableIndex table_id, FieldIndex column_id, idx_t snapshot_id) {
+	lock_guard<mutex> guard(columns_with_values_lock);
+	if (!columns_with_values_snapshot.IsValid() || columns_with_values_snapshot.GetIndex() != snapshot_id) {
+		columns_with_values.clear();
+		columns_with_values_snapshot = snapshot_id;
+	}
+	columns_with_values.emplace(table_id.index, column_id.index);
+}
+
+void DuckLakeCatalog::AdvanceColumnsWithValues(idx_t snapshot_id) {
+	lock_guard<mutex> guard(columns_with_values_lock);
+	if (columns_with_values_snapshot.IsValid() && columns_with_values_snapshot.GetIndex() + 1 == snapshot_id) {
+		columns_with_values_snapshot = snapshot_id;
+	}
+}
+
+void DuckLakeCatalog::ForgetColumnsWithValues(const set<TableIndex> &table_ids) {
+	lock_guard<mutex> guard(columns_with_values_lock);
+	for (auto &table_id : table_ids) {
+		auto begin = columns_with_values.lower_bound(make_pair(table_id.index, idx_t(0)));
+		auto end = columns_with_values.lower_bound(make_pair(table_id.index + 1, idx_t(0)));
+		columns_with_values.erase(begin, end);
+	}
 }
 
 string DuckLakeCatalog::StatsCacheKey(idx_t next_file_id, TableIndex table_id) const {
@@ -1382,7 +1511,9 @@ void DuckLakeCatalog::RegisterCatalog() {
 	// these checks run before the metadata database is attached, which replaces any database of the same name
 	auto &name = GetAttached().GetName();
 	bool replace = options.on_conflict == OnCreateConflict::REPLACE_ON_CONFLICT;
-	if (!replace && DatabaseManager::Get(GetDatabase()).GetDatabase(name)) {
+	// a main database is registered before it is loaded, so it finds itself
+	auto existing = DatabaseManager::Get(GetDatabase()).GetDatabase(name);
+	if (!replace && existing && existing.get() != &GetAttached()) {
 		throw BinderException("Failed to attach database: database with name \"%s\" already exists",
 		                      name.GetIdentifierName());
 	}
